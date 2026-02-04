@@ -23,6 +23,57 @@ load_dotenv()
 mcp = FastMCP("cisco-sdwan-manager")
 
 
+class AnalyticsCloudSession:
+    """Clase para gestionar la sesión con Cisco Analytics Cloud"""
+    
+    def __init__(self):
+        self.base_url = "https://us02.analytics.sdwan.cisco.com"
+        self.session = requests.Session()
+        self.session.verify = False
+        
+        # Extraer cookies de Analytics Cloud
+        try:
+            import browser_cookie3
+            cj = browser_cookie3.chrome(domain_name='us02.analytics.sdwan.cisco.com')
+            
+            csrf_token = None
+            overlay_id = None
+            
+            for cookie in cj:
+                if 'cisco.com' in cookie.domain:
+                    self.session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+                    
+                if cookie.name == 'okta-oauth-state':
+                    csrf_token = cookie.value
+                elif cookie.name == 'cl-overlay-id':
+                    overlay_id = cookie.value
+            
+            # Headers necesarios
+            self.session.headers.update({
+                'Content-Type': 'application/json',
+                'Accept': 'application/json, text/plain, */*',
+                'x-csrftoken': csrf_token if csrf_token else '',
+                'sdwan-overlay': overlay_id if overlay_id else '',
+                'Origin': 'https://us02.analytics.sdwan.cisco.com',
+                'Referer': 'https://us02.analytics.sdwan.cisco.com/analytics/v4/overview',
+            })
+                    
+        except Exception as e:
+            print(f"Warning: No se pudo extraer cookies de Analytics: {e}")
+    
+    def post(self, endpoint: str, json_data: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+        """Hacer petición POST a Analytics Cloud"""
+        url = f"{self.base_url}{endpoint}"
+        response = self.session.post(url, json=json_data, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+
+def get_analytics_session():
+    """Obtiene una sesión de Analytics Cloud"""
+    return AnalyticsCloudSession()
+
+
 class VManageSession:
     """Clase para gestionar la sesión con vManage usando cookies del navegador"""
     
@@ -1119,109 +1170,105 @@ def diagnostico_completo_dispositivo(device_id: str) -> str:
 
 
 @mcp.tool()
-def analizar_trafico_total_red() -> str:
+def analizar_trafico_total_red(horas: int = 12) -> str:
     """
-    Analiza el tráfico de aplicaciones en toda la red SD-WAN consolidando datos de todos los dispositivos edge.
-    Útil para identificar las aplicaciones más consumidas a nivel red.
+    Analiza el tráfico de aplicaciones en toda la red SD-WAN usando Cisco Analytics Cloud.
+    Obtiene datos agregados de todas las aplicaciones detectadas por DPI en la red completa.
+    
+    Args:
+        horas: Ventana de tiempo en horas para el análisis (default: 12)
     
     Returns:
-        Análisis agregado de tráfico por aplicación en toda la red con porcentajes y estadísticas
+        Top aplicaciones por consumo de ancho de banda con estadísticas de QoE
     """
     try:
-        session = get_vmanage_session()
+        analytics = get_analytics_session()
         
-        # 1. Obtener todos los dispositivos edge
-        devices_result = session.get("/dataservice/device", timeout=20)
+        # Calcular ventana de tiempo - Analytics usa intervalos específicos
+        from datetime import datetime, timedelta
+        now = datetime.now()
         
-        if 'data' not in devices_result:
-            return "No se pudieron obtener dispositivos"
+        # Redondear a intervalos de 5 minutos
+        minute = (now.minute // 5) * 5
+        end_time = now.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
         
-        edge_devices = [
-            d for d in devices_result['data'] 
-            if d.get('device-type') in ['vedge', 'vmanage']
-        ]
+        start = now - timedelta(hours=horas)
+        start_minute = (start.minute // 5) * 5  
+        start_time = start.replace(minute=start_minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
         
-        # 2. Consolidar aplicaciones de todos los dispositivos
-        apps_consolidadas = {}
-        dispositivos_procesados = 0
+        # Payload para Analytics Cloud
+        payload = {
+            "time_frame": f"{horas}h" if horas <= 24 else "24h",
+            "entry_ts": {
+                "start": start_time,
+                "end": end_time
+            }
+        }
         
-        for device in edge_devices[:50]:  # Limitar a 50 para no saturar
-            device_id = device.get('deviceId') or device.get('uuid')
-            device_name = device.get('host-name')
-            
-            try:
-                endpoint = f"/dataservice/device/dpi/applications?deviceId={device_id}"
-                result = session.get(endpoint, timeout=10)
-                
-                if 'data' in result and result['data']:
-                    dispositivos_procesados += 1
-                    
-                    for app in result['data']:
-                        app_name = app.get('application', 'Unknown')
-                        app_family = app.get('family', 'Other')
-                        
-                        if app_name not in apps_consolidadas:
-                            apps_consolidadas[app_name] = {
-                                'familia': app_family,
-                                'bytes_rx': 0,
-                                'bytes_tx': 0,
-                                'paquetes_rx': 0,
-                                'paquetes_tx': 0,
-                                'dispositivos': set(),
-                                'sesiones_totales': 0
-                            }
-                        
-                        apps_consolidadas[app_name]['bytes_rx'] += app.get('octets-received', 0)
-                        apps_consolidadas[app_name]['bytes_tx'] += app.get('octets-sent', 0)
-                        apps_consolidadas[app_name]['paquetes_rx'] += app.get('packets-received', 0)
-                        apps_consolidadas[app_name]['paquetes_tx'] += app.get('packets-sent', 0)
-                        apps_consolidadas[app_name]['sesiones_totales'] += app.get('active-flows', 0)
-                        apps_consolidadas[app_name]['dispositivos'].add(device_name)
-                        
-            except Exception as e:
-                continue  # Saltar dispositivos con error
+        # Obtener datos de Analytics
+        endpoint = "/analytics/api/v4/dataservice/aggregate/applications"
+        result = analytics.post(endpoint, json_data=payload, timeout=30)
         
-        # 3. Generar reporte
-        if not apps_consolidadas:
-            return "No se encontraron datos de aplicaciones en la red"
+        if 'data' not in result or not result['data']:
+            return f"⚠️  No hay datos de aplicaciones disponibles para las últimas {horas} horas.\nVerifica que DPI esté habilitado y haya tráfico clasificado."
         
-        apps_lista = []
-        total_bytes_red = 0
+        apps = result['data']
+        total_apps = result.get('count', len(apps))
         
-        for app_name, data in apps_consolidadas.items():
-            bytes_total = data['bytes_rx'] + data['bytes_tx']
-            total_bytes_red += bytes_total
-            
-            apps_lista.append({
-                'aplicacion': app_name,
-                'familia': data['familia'],
-                'bytes_total_tb': round(bytes_total / (1024**4), 3),
-                'bytes_rx_tb': round(data['bytes_rx'] / (1024**4), 3),
-                'bytes_tx_tb': round(data['bytes_tx'] / (1024**4), 3),
-                'num_dispositivos': len(data['dispositivos']),
-                'sesiones_activas': data['sesiones_totales'],
-                'porcentaje_trafico': 0  # Se calculará después
-            })
+        # Ordenar por usage (bytes totales)
+        apps_sorted = sorted(apps, key=lambda x: x.get('usage', 0), reverse=True)
         
-        # Calcular porcentajes
-        for app in apps_lista:
-            app['porcentaje_trafico'] = round(
-                (app['bytes_total_tb'] / (total_bytes_red / (1024**4))) * 100, 2
-            )
+        # Calcular total de tráfico
+        total_bytes = sum(app.get('usage', 0) for app in apps)
         
-        # Ordenar por bytes totales
-        apps_lista.sort(key=lambda x: x['bytes_total_tb'], reverse=True)
-        
-        return (
+        # Generar reporte
+        resultado = (
             f"🌐 ANÁLISIS DE TRÁFICO - RED COMPLETA\n\n"
-            f"Dispositivos analizados: {dispositivos_procesados}/{len(edge_devices)}\n"
-            f"Aplicaciones detectadas: {len(apps_lista)}\n"
-            f"Tráfico total: {total_bytes_red / (1024**4):.2f} TB\n\n"
-            f"Top 20 aplicaciones:\n{apps_lista[:20]}"
+            f"Período: Últimas {horas} horas\n"
+            f"Ventana: {start_time} a {end_time}\n"
+            f"Total de aplicaciones: {total_apps}\n"
+            f"Tráfico total: {total_bytes / (1024**4):.2f} TB\n\n"
+            f"🏆 TOP 20 APLICACIONES:\n"
         )
         
+        for i, app in enumerate(apps_sorted[:20], 1):
+            name = app.get('application', 'Unknown')
+            family = app.get('application_family_long_name', 'N/A')
+            usage = app.get('usage', 0)
+            usage_gb = usage / (1024**3)
+            percent = (usage / total_bytes * 100) if total_bytes > 0 else 0
+            site_count = app.get('site_count', 0)
+            
+            # Métricas de QoE
+            latency = app.get('latency', 0)
+            jitter = app.get('jitter', 0)
+            packet_loss = app.get('packet_loss', 0)
+            vqoe_score = app.get('vqoe_score', 0)
+            vqoe_status = app.get('vqoe_status', 'unknown')
+            
+            # Indicador de calidad
+            if vqoe_status == 'unknown' or vqoe_score == 0:
+                quality = "⚪"
+            elif vqoe_score >= 8:
+                quality = "🟢"
+            elif vqoe_score >= 5:
+                quality = "🟡"
+            else:
+                quality = "🔴"
+            
+            resultado += f"\n{i}. {name} {quality}"
+            resultado += f"\n   Familia: {family}"
+            resultado += f"\n   Uso: {usage_gb:.2f} GB ({percent:.1f}%)"
+            resultado += f"\n   Sitios: {site_count}"
+            
+            if vqoe_status != 'unknown' and vqoe_score > 0:
+                resultado += f"\n   QoE: {vqoe_score:.1f}/10 | Latencia: {latency:.1f}ms | Jitter: {jitter:.2f}ms | Pérdida: {packet_loss:.2f}%"
+        
+        return resultado
+        
     except Exception as e:
-        return f"Error al analizar tráfico de red: {str(e)}"
+        # Fallback al método antiguo si Analytics Cloud falla
+        return f"⚠️  Error al conectar con Analytics Cloud: {str(e)}\n\nNota: Asegúrate de estar logueado en https://us02.analytics.sdwan.cisco.com"
 
 
 @mcp.tool()
