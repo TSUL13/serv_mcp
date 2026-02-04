@@ -22,20 +22,52 @@ class AnalyticsCloudSession:
         self.session = requests.Session()
         self.session.verify = False
         
-        import browser_cookie3
-        cj = browser_cookie3.chrome(domain_name='us02.analytics.sdwan.cisco.com')
-        
+        # Intentar cargar cookies desde archivo primero
         csrf_token = None
         overlay_id = None
+        session_cookie = None
         
-        for cookie in cj:
-            if 'cisco.com' in cookie.domain:
-                self.session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+        cookies_file = '.analytics_cookies.json'
+        
+        if os.path.exists(cookies_file):
+            try:
+                import json
+                with open(cookies_file, 'r') as f:
+                    cookies_data = json.load(f)
                 
-            if cookie.name == 'okta-oauth-state':
-                csrf_token = cookie.value
-            elif cookie.name == 'cl-overlay-id':
-                overlay_id = cookie.value
+                session_cookie = cookies_data.get('session')
+                csrf_token = cookies_data.get('csrf_token')
+                overlay_id = cookies_data.get('overlay_id')
+                
+                if session_cookie:
+                    self.session.cookies.set('session', session_cookie, 
+                                            domain='.analytics.sdwan.cisco.com', 
+                                            path='/')
+                if csrf_token:
+                    self.session.cookies.set('okta-oauth-state', csrf_token,
+                                            domain='.analytics.sdwan.cisco.com',
+                                            path='/')
+                if overlay_id:
+                    self.session.cookies.set('cl-overlay-id', overlay_id,
+                                            domain='.analytics.sdwan.cisco.com',
+                                            path='/')
+                    
+            except Exception as e:
+                print(f"Warning: No se pudo leer cookies desde archivo: {e}")
+        
+        # Fallback: intentar extraer del navegador
+        if not session_cookie or not csrf_token:
+            import browser_cookie3
+            cj = browser_cookie3.chrome(domain_name='us02.analytics.sdwan.cisco.com')
+            
+            for cookie in cj:
+                if 'cisco.com' in cookie.domain:
+                    self.session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+                    
+                if cookie.name == 'okta-oauth-state':
+                    csrf_token = cookie.value
+                elif cookie.name == 'cl-overlay-id':
+                    overlay_id = cookie.value
         
         self.session.headers.update({
             'Content-Type': 'application/json',

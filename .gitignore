@@ -40,3 +40,4 @@ wheels/
 .DS_Store
 Thumbs.db
 venvsource/
+.analytics_cookies.json

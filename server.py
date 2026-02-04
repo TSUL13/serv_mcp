@@ -31,35 +31,67 @@ class AnalyticsCloudSession:
         self.session = requests.Session()
         self.session.verify = False
         
-        # Extraer cookies de Analytics Cloud
-        try:
-            import browser_cookie3
-            cj = browser_cookie3.chrome(domain_name='us02.analytics.sdwan.cisco.com')
-            
-            csrf_token = None
-            overlay_id = None
-            
-            for cookie in cj:
-                if 'cisco.com' in cookie.domain:
-                    self.session.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+        # Intentar cargar cookies desde archivo primero (más confiable desde Claude Desktop)
+        csrf_token = None
+        overlay_id = None
+        session_cookie = None
+        
+        cookies_file = os.path.join(os.path.dirname(__file__), '.analytics_cookies.json')
+        
+        if os.path.exists(cookies_file):
+            try:
+                import json
+                with open(cookies_file, 'r') as f:
+                    cookies_data = json.load(f)
+                
+                session_cookie = cookies_data.get('session')
+                csrf_token = cookies_data.get('csrf_token')
+                overlay_id = cookies_data.get('overlay_id')
+                
+                if session_cookie:
+                    self.session.cookies.set('session', session_cookie, 
+                                            domain='.analytics.sdwan.cisco.com', 
+                                            path='/')
+                if csrf_token:
+                    self.session.cookies.set('okta-oauth-state', csrf_token,
+                                            domain='.analytics.sdwan.cisco.com',
+                                            path='/')
+                if overlay_id:
+                    self.session.cookies.set('cl-overlay-id', overlay_id,
+                                            domain='.analytics.sdwan.cisco.com',
+                                            path='/')
                     
-                if cookie.name == 'okta-oauth-state':
-                    csrf_token = cookie.value
-                elif cookie.name == 'cl-overlay-id':
-                    overlay_id = cookie.value
-            
-            # Headers necesarios
-            self.session.headers.update({
-                'Content-Type': 'application/json',
-                'Accept': 'application/json, text/plain, */*',
-                'x-csrftoken': csrf_token if csrf_token else '',
-                'sdwan-overlay': overlay_id if overlay_id else '',
-                'Origin': 'https://us02.analytics.sdwan.cisco.com',
-                'Referer': 'https://us02.analytics.sdwan.cisco.com/analytics/v4/overview',
-            })
-                    
-        except Exception as e:
-            print(f"Warning: No se pudo extraer cookies de Analytics: {e}")
+            except Exception as e:
+                print(f"Warning: No se pudo leer cookies desde archivo: {e}")
+        
+        # Si no hay cookies del archivo, intentar extraerlas del navegador
+        if not session_cookie or not csrf_token:
+            try:
+                import browser_cookie3
+                cj = browser_cookie3.chrome(domain_name='us02.analytics.sdwan.cisco.com')
+                
+                for cookie in cj:
+                    if 'cisco.com' in cookie.domain:
+                        self.session.cookies.set(cookie.name, cookie.value, 
+                                                domain=cookie.domain, path=cookie.path)
+                        
+                    if cookie.name == 'okta-oauth-state':
+                        csrf_token = cookie.value
+                    elif cookie.name == 'cl-overlay-id':
+                        overlay_id = cookie.value
+                        
+            except Exception as e:
+                print(f"Warning: No se pudo extraer cookies del navegador: {e}")
+        
+        # Headers necesarios
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/plain, */*',
+            'x-csrftoken': csrf_token if csrf_token else '',
+            'sdwan-overlay': overlay_id if overlay_id else '',
+            'Origin': 'https://us02.analytics.sdwan.cisco.com',
+            'Referer': 'https://us02.analytics.sdwan.cisco.com/analytics/v4/overview',
+        })
     
     def post(self, endpoint: str, json_data: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
         """Hacer petición POST a Analytics Cloud"""
