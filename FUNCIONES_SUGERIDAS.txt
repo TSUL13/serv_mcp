@@ -1,0 +1,374 @@
+================================================================================
+  🎯 FUNCIONES ADICIONALES SUGERIDAS PARA EL SERVIDOR MCP
+  Cisco SD-WAN vManage - Extensiones Recomendadas
+================================================================================
+
+📋 FUNCIONES ACTUALES (4):
+  ✅ listar_dispositivos - Lista todos los dispositivos
+  ✅ ver_salud_equipo - Estado de salud de un dispositivo
+  ✅ ver_sesiones_bfd - Sesiones BFD de un dispositivo
+  ✅ listar_alarmas_criticas - Alarmas críticas del sistema
+
+================================================================================
+  🚀 FUNCIONES RECOMENDADAS PARA AGREGAR
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 1: MONITOREO Y ESTADÍSTICAS                                    │
+└──────────────────────────────────────────────────────────────────────────┘
+
+5. 📊 ver_estadisticas_interfaces(device_id)
+   Propósito: Mostrar estadísticas de todas las interfaces de un dispositivo
+   Datos: Tráfico entrante/saliente, paquetes, errores, estado up/down
+   Endpoint: /dataservice/device/interface/stats
+   Utilidad: ★★★★★ (Muy útil para troubleshooting)
+
+6. 📈 ver_uso_cpu_memoria(device_id)
+   Propósito: Monitorear recursos del sistema
+   Datos: % CPU, % memoria, procesos top
+   Endpoint: /dataservice/device/system/status
+   Utilidad: ★★★★★ (Crítico para performance)
+
+7. 🌡️ ver_metricas_tiempo_real(device_id)
+   Propósito: Estadísticas en tiempo real
+   Datos: Latencia, pérdida de paquetes, jitter
+   Endpoint: /dataservice/device/app-route/statistics
+   Utilidad: ★★★★☆ (Excelente para QoS)
+
+8. 📉 ver_historial_disponibilidad(device_id, dias=7)
+   Propósito: Uptime histórico de dispositivos
+   Datos: Caídas, reinios, tiempo total de uptime
+   Endpoint: /dataservice/device/history
+   Utilidad: ★★★★☆ (Importante para SLA)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 2: CONECTIVIDAD Y TÚNELES                                      │
+└──────────────────────────────────────────────────────────────────────────┘
+
+9. 🔗 ver_tuneles_omp(device_id)
+   Propósito: Lista túneles OMP (Overlay Management Protocol)
+   Datos: Estado de túneles, peers, rutas anunciadas
+   Endpoint: /dataservice/device/omp/peers
+   Utilidad: ★★★★★ (Fundamental para SD-WAN)
+
+10. 🌐 ver_control_connections(device_id)
+    Propósito: Conexiones a vSmart controllers
+    Datos: Estado, peer, protocol, uptime
+    Endpoint: /dataservice/device/control/connections
+    Utilidad: ★★★★★ (Crítico para control plane)
+
+11. 🛣️ ver_rutas_activas(device_id, vpn_id="0")
+    Propósito: Tabla de ruteo del dispositivo
+    Datos: Rutas aprendidas, next-hop, protocolo
+    Endpoint: /dataservice/device/ip/routes
+    Utilidad: ★★★★☆ (Útil para troubleshooting routing)
+
+12. 🔐 ver_certificados(device_id)
+    Propósito: Estado de certificados del dispositivo
+    Datos: Validez, expiración, CA
+    Endpoint: /dataservice/certificate/vedge/list
+    Utilidad: ★★★☆☆ (Importante para seguridad)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 3: APLICACIONES Y POLÍTICAS                                    │
+└──────────────────────────────────────────────────────────────────────────┘
+
+13. 🎯 ver_aplicaciones_top(device_id, top=10)
+    Propósito: Aplicaciones que más consumen ancho de banda
+    Datos: Nombre de app, bytes, paquetes, % uso
+    Endpoint: /dataservice/device/dpi/applications
+    Utilidad: ★★★★★ (Excelente para análisis de tráfico)
+
+14. 📜 ver_politicas_aplicadas(device_id)
+    Propósito: Políticas activas en el dispositivo
+    Datos: QoS, seguridad, routing policies
+    Endpoint: /dataservice/device/policy/summary
+    Utilidad: ★★★★☆ (Útil para validar configuración)
+
+15. 🚦 ver_estadisticas_qos(device_id, interface)
+    Propósito: Estadísticas de calidad de servicio
+    Datos: Clases, prioridades, drops, delays
+    Endpoint: /dataservice/device/qos/statistics
+    Utilidad: ★★★★☆ (Importante para voice/video)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 4: SEGURIDAD Y ALARMAS                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+
+16. 🔒 ver_eventos_seguridad(horas=24)
+    Propósito: Eventos de seguridad recientes
+    Datos: IPS alerts, firewall blocks, intrusion attempts
+    Endpoint: /dataservice/event/security
+    Utilidad: ★★★★★ (Crítico para seguridad)
+
+17. ⚠️ ver_todas_alarmas(severidad="critical,major", horas=24)
+    Propósito: Alarmas por severidad (más flexible que actual)
+    Datos: Alarmas filtradas por tipo y tiempo
+    Endpoint: /dataservice/alarms
+    Utilidad: ★★★★☆ (Mejora la función actual)
+
+18. 📋 ver_historial_alarmas(device_id, dias=7)
+    Propósito: Historial de alarmas de un dispositivo
+    Datos: Alarmas resueltas y activas
+    Endpoint: /dataservice/alarms/history
+    Utilidad: ★★★☆☆ (Útil para análisis de tendencias)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 5: CONFIGURACIÓN Y CAMBIOS                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+19. ⚙️ ver_configuracion_running(device_id)
+    Propósito: Configuración activa del dispositivo
+    Datos: Running config completa
+    Endpoint: /dataservice/device/config/running
+    Utilidad: ★★★★☆ (Útil para backup/audit)
+
+20. 📝 ver_cambios_pendientes()
+    Propósito: Cambios en vManage no aplicados
+    Datos: Dispositivos con cambios pendientes
+    Endpoint: /dataservice/device/action/status/tasks
+    Utilidad: ★★★★☆ (Importante para change management)
+
+21. 🔄 ver_historial_cambios(device_id, dias=30)
+    Propósito: Cambios de configuración aplicados
+    Datos: Qué cambió, cuándo, quién lo hizo
+    Endpoint: /dataservice/device/config/diff
+    Utilidad: ★★★★☆ (Auditoría y troubleshooting)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 6: INFORMACIÓN DEL SISTEMA                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+22. 📊 ver_resumen_red()
+    Propósito: Dashboard general de la red SD-WAN
+    Datos: Total devices, up/down, alarmas, salud general
+    Endpoint: /dataservice/device/counters
+    Utilidad: ★★★★★ (Excelente para overview rápido)
+
+23. 🏢 ver_dispositivos_por_sitio(site_id)
+    Propósito: Listar dispositivos de un sitio específico
+    Datos: Todos los devices en un site-id
+    Endpoint: /dataservice/device?site-id={site_id}
+    Utilidad: ★★★★☆ (Útil para gestión por sitio)
+
+24. 📜 ver_licencias()
+    Propósito: Estado de licencias del sistema
+    Datos: Licencias activas, expiración, uso
+    Endpoint: /dataservice/device/license
+    Utilidad: ★★★☆☆ (Importante para compliance)
+
+25. 👥 ver_usuarios_conectados()
+    Propósito: Sesiones activas en vManage
+    Datos: Usuarios, IP, tiempo de sesión
+    Endpoint: /dataservice/admin/user/sessions
+    Utilidad: ★★★☆☆ (Útil para auditoría)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 7: COMANDOS Y ACCIONES (Opcional - Requiere permisos)         │
+└──────────────────────────────────────────────────────────────────────────┘
+
+26. 🔄 reiniciar_dispositivo(device_id) [PELIGROSO]
+    Propósito: Reiniciar un edge router
+    Método: POST /dataservice/device/action/reboot
+    Utilidad: ★★★☆☆ (Útil pero requiere confirmación)
+
+27. 🔧 sincronizar_configuracion(device_id)
+    Propósito: Forzar push de configuración
+    Método: POST /dataservice/device/action/config
+    Utilidad: ★★★★☆ (Útil cuando hay desincronización)
+
+28. 🧹 limpiar_alarmas(device_id)
+    Propósito: Marcar alarmas como vistas/resueltas
+    Método: POST /dataservice/alarms/markviewed
+    Utilidad: ★★★☆☆ (Mantenimiento de alarmas)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ CATEGORÍA 8: REPORTES Y ANÁLISIS                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+
+29. 📈 generar_reporte_trafico(device_id, horas=24)
+    Propósito: Reporte de tráfico agregado
+    Datos: Total bytes, top aplicaciones, tendencias
+    Endpoint: Multiple endpoints combinados
+    Utilidad: ★★★★☆ (Excelente para reportes ejecutivos)
+
+30. 🎯 buscar_dispositivo(criterio)
+    Propósito: Búsqueda flexible por nombre, IP, modelo, etc.
+    Datos: Dispositivos que coincidan con criterio
+    Endpoint: /dataservice/device + filtrado
+    Utilidad: ★★★★★ (Muy útil para grandes redes)
+
+================================================================================
+  🏆 TOP 10 FUNCIONES MÁS RECOMENDADAS
+================================================================================
+
+Prioridad ALTA (Implementar primero):
+  1. 📊 ver_estadisticas_interfaces - Fundamental para troubleshooting
+  2. 📈 ver_uso_cpu_memoria - Crítico para monitoreo
+  3. 🔗 ver_tuneles_omp - Esencial para SD-WAN
+  4. 🌐 ver_control_connections - Crítico para control plane
+  5. 🎯 ver_aplicaciones_top - Excelente para análisis de tráfico
+  6. 📊 ver_resumen_red - Dashboard general muy útil
+  7. 🔒 ver_eventos_seguridad - Importante para seguridad
+  8. 🎯 buscar_dispositivo - Muy útil en redes grandes
+  9. ⚠️ ver_todas_alarmas - Mejora la función actual
+  10. 🏢 ver_dispositivos_por_sitio - Útil para gestión
+
+================================================================================
+  💡 FUNCIONES COMBINADAS (Más Inteligentes)
+================================================================================
+
+31. 🔍 diagnostico_completo_dispositivo(device_id)
+    Combina múltiples endpoints para dar diagnóstico completo:
+    - Estado de salud
+    - CPU/Memoria
+    - Interfaces
+    - Túneles
+    - Alarmas activas
+    - Aplicaciones top
+    Utilidad: ★★★★★ (Super útil, todo en uno)
+
+32. 🚨 detectar_problemas_red()
+    Análisis inteligente que identifica:
+    - Dispositivos caídos
+    - Alto uso de CPU/memoria
+    - Túneles caídos
+    - Alarmas críticas
+    - Interfaces con errores
+    Utilidad: ★★★★★ (Proactivo, detecta problemas)
+
+33. 📊 comparar_dispositivos(device_id1, device_id2)
+    Compara métricas de dos dispositivos:
+    - Rendimiento
+    - Configuración
+    - Tráfico
+    Utilidad: ★★★★☆ (Útil para troubleshooting comparativo)
+
+================================================================================
+  🎨 MEJORAS A FUNCIONES EXISTENTES
+================================================================================
+
+Función actual: listar_dispositivos()
+Mejoras sugeridas:
+  - Agregar filtros: por tipo, site, estado
+  - Agregar ordenamiento: por nombre, uptime, etc.
+  - Agregar paginación: para redes muy grandes
+  - Agregar resumen: total, up, down, unreachable
+
+Función actual: ver_salud_equipo(device_id)
+Mejoras sugeridas:
+  - Agregar métricas de rendimiento (CPU, memoria)
+  - Agregar estado de interfaces principales
+  - Agregar número de alarmas activas
+  - Agregar último tiempo de sincronización
+
+Función actual: listar_alarmas_criticas()
+Mejoras sugeridas:
+  - Agregar filtro por severidad
+  - Agregar filtro por tiempo (últimas 24h, 7 días, etc.)
+  - Agregar agrupación por dispositivo
+  - Agregar contador de alarmas por tipo
+
+================================================================================
+  📝 IMPLEMENTACIÓN SUGERIDA
+================================================================================
+
+FASE 1 - Esenciales (5 funciones):
+  1. ver_estadisticas_interfaces
+  2. ver_uso_cpu_memoria
+  3. ver_tuneles_omp
+  4. ver_control_connections
+  5. ver_resumen_red
+
+FASE 2 - Análisis (5 funciones):
+  6. ver_aplicaciones_top
+  7. buscar_dispositivo
+  8. ver_dispositivos_por_sitio
+  9. ver_eventos_seguridad
+  10. diagnostico_completo_dispositivo
+
+FASE 3 - Avanzadas (5 funciones):
+  11. ver_rutas_activas
+  12. ver_politicas_aplicadas
+  13. ver_configuracion_running
+  14. detectar_problemas_red
+  15. generar_reporte_trafico
+
+================================================================================
+  🔧 EJEMPLO DE IMPLEMENTACIÓN
+================================================================================
+
+Para implementar "ver_estadisticas_interfaces", agregarías a server.py:
+
+@mcp.tool()
+def ver_estadisticas_interfaces(device_id: str) -> str:
+    """
+    Consulta estadísticas de todas las interfaces de un dispositivo
+    
+    Args:
+        device_id: System IP del dispositivo
+    
+    Returns:
+        Estadísticas detalladas de interfaces
+    """
+    try:
+        session = get_vmanage_session()
+        endpoint = f"/dataservice/device/interface/stats?deviceId={device_id}"
+        result = session.get(endpoint)
+        
+        if 'data' in result:
+            interfaces = result['data']
+            stats = []
+            
+            for iface in interfaces:
+                stats.append({
+                    'interface': iface.get('interface'),
+                    'status': iface.get('if-oper-status'),
+                    'rx_bytes': iface.get('rx-kbps'),
+                    'tx_bytes': iface.get('tx-kbps'),
+                    'rx_errors': iface.get('rx-errors'),
+                    'tx_errors': iface.get('tx-errors')
+                })
+            
+            return f"Estadísticas de {len(stats)} interfaces:\n{stats}"
+        
+        return "No se encontraron estadísticas"
+        
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+================================================================================
+  ❓ PREGUNTAS PARA DECIDIR
+================================================================================
+
+1. ¿Qué tipo de operaciones haces más frecuentemente en vManage?
+2. ¿Necesitas funciones de solo lectura o también de escritura?
+3. ¿Qué tamaño tiene tu red? (afecta necesidad de búsqueda/filtros)
+4. ¿Necesitas reportes o solo consultas en tiempo real?
+5. ¿Qué información te gustaría preguntar a Claude sobre tu red?
+
+================================================================================
+  ✅ RECOMENDACIÓN FINAL
+================================================================================
+
+Para un MCP completo y útil, te recomiendo implementar:
+
+MÍNIMO (Total: 9 herramientas):
+  ✅ 4 actuales
+  ➕ 5 de FASE 1 (esenciales)
+
+RECOMENDADO (Total: 14 herramientas):
+  ✅ 4 actuales
+  ➕ 5 de FASE 1
+  ➕ 5 de FASE 2
+
+COMPLETO (Total: 19 herramientas):
+  ✅ 4 actuales
+  ➕ 5 de FASE 1
+  ➕ 5 de FASE 2
+  ➕ 5 de FASE 3
+
+================================================================================
+¿Quieres que implemente alguna de estas funciones?
+Dime cuáles te interesan más y las agrego al servidor MCP.
+================================================================================

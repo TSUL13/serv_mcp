@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "vmanage-remoto": {
+      "command": "ssh",
+      "args": [
+        "-i",
+        "/home/tu-usuario/.ssh/id_rsa_mcp",
+        "usuario@tu-servidor.com",
+        "/home/usuario/serv_mcp/venv/bin/python",
+        "/home/usuario/serv_mcp/server.py"
+      ]
+    }
+  }
+}
