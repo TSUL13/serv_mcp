@@ -1,6 +1,22 @@
-# Servidor MCP para Cisco SD-WAN
+# 🚀 Servidor MCP para Cisco SD-WAN
 
-Servidor Model Context Protocol (MCP) para gestionar infraestructura de Cisco SD-WAN a través de vManage.
+Servidor Model Context Protocol (MCP) para gestionar infraestructura de Cisco SD-WAN a través de vManage y Analytics Cloud.
+
+## ⚡ INICIO RÁPIDO
+
+```bash
+cd /home/tsul/Documentos/serv_mcp
+./start_mcp.sh
+```
+
+Luego abre **Claude Desktop** y pregunta:
+```
+Dame un top 10 de las aplicaciones más usadas en la red
+```
+
+**¿Primera vez?** Ver [GUIA_ARRANQUE_COMPLETA.md](GUIA_ARRANQUE_COMPLETA.md)
+
+---
 
 ## 🚀 Características
 
