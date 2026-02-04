@@ -5,11 +5,37 @@ Servidor Model Context Protocol (MCP) para gestionar infraestructura de Cisco SD
 ## 🚀 Características
 
 - **Autenticación robusta** con vManage (sesión y tokens XSRF)
-- **4 herramientas MCP** para Network Automation:
+- **19 herramientas MCP** para Network Automation:
+  
+  **Gestión de Dispositivos:**
   - `listar_dispositivos`: Inventario completo de dispositivos
   - `ver_salud_equipo`: Estado y salud de un dispositivo específico
+  - `ver_estado_sistema_dispositivo`: CPU, memoria, disco, uptime
+  - `ver_detalle_dispositivo`: Información detallada de hardware y software
+  
+  **Conectividad y Túneles:**
   - `ver_sesiones_bfd`: Estado de túneles BFD
+  - `ver_total_sesiones_bfd`: Total de sesiones BFD en la red
+  - `ver_tuneles_ipsec`: Túneles IPsec activos
+  
+  **Monitoreo y Alertas:**
   - `listar_alarmas_criticas`: Alarmas críticas de las últimas 24 horas
+  - `diagnosticar_dispositivo`: Diagnóstico completo de salud
+  
+  **Analytics y Tráfico (Cisco Analytics):**
+  - `ver_aplicaciones_top`: Top aplicaciones por dispositivo (DPI)
+  - `analizar_trafico_total_red`: Tráfico consolidado de toda la red
+  - `comparar_trafico_sitios`: Comparación entre dos sitios
+  - `detectar_aplicaciones_no_autorizadas`: Detección de shadow IT
+  
+  **Políticas y Configuración:**
+  - `ver_politicas_activas`: Políticas aplicadas en la red
+  - `ver_plantillas`: Templates de configuración
+  - `ver_cambios_configuracion`: Auditoría de cambios
+  
+  **Interfaces y Rendimiento:**
+  - `ver_interfaces_dispositivo`: Estado de interfaces
+  - `ver_estadisticas_interfaz`: Métricas de rendimiento
 
 ## 📋 Requisitos
 
