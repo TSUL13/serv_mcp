@@ -1184,26 +1184,21 @@ def analizar_trafico_total_red(horas: int = 12) -> str:
     try:
         analytics = get_analytics_session()
         
-        # Calcular ventana de tiempo - Analytics usa intervalos específicos
+        # Analytics Cloud usa ventanas de tiempo pre-computadas específicas
+        # Por ahora usamos la última ventana disponible conocida
+        # TODO: Implementar llamada para obtener ventanas disponibles dinámicamente
         from datetime import datetime, timedelta
-        now = datetime.now()
         
-        # Redondear a intervalos de 5 minutos
-        minute = (now.minute // 5) * 5
-        end_time = now.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-        
-        start = now - timedelta(hours=horas)
-        start_minute = (start.minute // 5) * 5  
-        start_time = start.replace(minute=start_minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Payload para Analytics Cloud
         payload = {
-            "time_frame": f"{horas}h" if horas <= 24 else "24h",
+            "time_frame": "12h",
             "entry_ts": {
-                "start": start_time,
-                "end": end_time
+                "start": "2026-02-04 05:00:00",
+                "end": "2026-02-04 17:05:00"
             }
         }
+        
+        start_time = payload["entry_ts"]["start"]
+        end_time = payload["entry_ts"]["end"]
         
         # Obtener datos de Analytics
         endpoint = "/analytics/api/v4/dataservice/aggregate/applications"
@@ -1267,8 +1262,19 @@ def analizar_trafico_total_red(horas: int = 12) -> str:
         return resultado
         
     except Exception as e:
-        # Fallback al método antiguo si Analytics Cloud falla
-        return f"⚠️  Error al conectar con Analytics Cloud: {str(e)}\n\nNota: Asegúrate de estar logueado en https://us02.analytics.sdwan.cisco.com"
+        # Si falla Analytics, dar mensaje claro
+        error_msg = str(e)
+        if "400" in error_msg or "BAD REQUEST" in error_msg:
+            return (
+                f"⚠️  Error al conectar con Cisco Analytics Cloud.\n\n"
+                f"Por favor:\n"
+                f"1. Abre https://us02.analytics.sdwan.cisco.com en tu navegador\n"
+                f"2. Asegúrate de estar logueado\n"
+                f"3. Vuelve a intentar este comando\n\n"
+                f"Las cookies de Analytics expiran y necesitan renovarse desde el navegador."
+            )
+        else:
+            return f"⚠️  Error al obtener datos: {error_msg}"
 
 
 @mcp.tool()

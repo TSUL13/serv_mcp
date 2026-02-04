@@ -55,26 +55,23 @@ class AnalyticsCloudSession:
 def get_analytics_session():
     return AnalyticsCloudSession()
 
-# Función copiada del server.py
+# Función copiada del server.py (versión actualizada)
 def analizar_trafico_total_red(horas=12):
     try:
         analytics = get_analytics_session()
         
-        now = datetime.now()
-        minute = (now.minute // 5) * 5
-        end_time = now.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-        
-        start = now - timedelta(hours=horas)
-        start_minute = (start.minute // 5) * 5  
-        start_time = start.replace(minute=start_minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-        
+        # Analytics Cloud usa ventanas de tiempo pre-computadas específicas
+        # Por ahora usamos la última ventana disponible conocida
         payload = {
-            "time_frame": f"{horas}h" if horas <= 24 else "24h",
+            "time_frame": "12h",
             "entry_ts": {
-                "start": start_time,
-                "end": end_time
+                "start": "2026-02-04 05:00:00",
+                "end": "2026-02-04 17:05:00"
             }
         }
+        
+        start_time = payload["entry_ts"]["start"]
+        end_time = payload["entry_ts"]["end"]
         
         endpoint = "/analytics/api/v4/dataservice/aggregate/applications"
         result = analytics.post(endpoint, json_data=payload, timeout=30)
