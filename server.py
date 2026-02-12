@@ -2985,6 +2985,226 @@ def ver_saturacion_sitio(sitio: str) -> str:
 
 
 @mcp.tool()
+def ver_aplicaciones_sitio(
+    sitio: str,
+    top: int = 30,
+    familia: str = ""
+) -> str:
+    """
+    Muestra qué aplicaciones están corriendo por los enlaces de un sitio SD-WAN específico.
+    Usa estadísticas DPI agregadas para mostrar el ranking de aplicaciones por consumo de ancho de banda,
+    agrupadas también por familia de aplicación.
+    
+    Args:
+        sitio: ID del sitio, parcial o hostname (ej: "51304", "304", "SDWAN-CJF-304-RT01")
+        top: Número de aplicaciones a mostrar (default: 30)
+        familia: (Opcional) Filtrar por familia de aplicación (ej: "web", "audio-video", "encrypted")
+    
+    Returns:
+        Ranking de aplicaciones por tráfico con familias, paquetes y flujos.
+        Incluye resumen por familia de aplicación.
+    
+    Ejemplo:
+        ver_aplicaciones_sitio("51304") - Todas las apps del sitio 51304
+        ver_aplicaciones_sitio("304", top=10) - Top 10 del sitio
+        ver_aplicaciones_sitio("51304", familia="audio-video") - Solo apps de audio/video
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo aplicaciones DPI del sitio: {sitio}", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Obtener dispositivos
+        devices_result = session.get("/dataservice/device")
+        all_devices = devices_result.get('data', [])
+        
+        # Buscar dispositivos del sitio
+        sitio_lower = sitio.strip().lower()
+        site_devices = []
+        
+        for dev in all_devices:
+            if dev.get('device-type') != 'vedge' or dev.get('reachability') != 'reachable':
+                continue
+            dev_site_id = str(dev.get('site-id', ''))
+            dev_hostname = dev.get('host-name', '').lower()
+            
+            if (sitio_lower == dev_site_id.lower() or
+                sitio_lower in dev_site_id or
+                sitio_lower in dev_hostname):
+                site_devices.append(dev)
+        
+        if not site_devices:
+            return (f"❌ No se encontraron dispositivos WAN Edge para '{sitio}'\n\n"
+                    f"Intenta con:\n"
+                    f"  • ver_aplicaciones_sitio('51304')\n"
+                    f"  • ver_aplicaciones_sitio('304')\n"
+                    f"  • ver_aplicaciones_sitio('SDWAN-CJF-304-RT01')")
+        
+        system_ips = [d.get('system-ip', '') for d in site_devices if d.get('system-ip')]
+        hostnames = [d.get('host-name', '') for d in site_devices]
+        site_ids = sorted(set(str(d.get('site-id', '')) for d in site_devices))
+        
+        def fmt_bytes(b):
+            if b > 1024**4: return f"{b / (1024**4):.2f} TB"
+            if b > 1024**3: return f"{b / (1024**3):.2f} GB"
+            if b > 1024**2: return f"{b / (1024**2):.1f} MB"
+            if b > 1024: return f"{b / 1024:.1f} KB"
+            return f"{b} B"
+        
+        resultado = f"📱 APLICACIONES DPI — "
+        if len(site_ids) == 1:
+            resultado += f"SITIO {site_ids[0]}\n"
+        else:
+            resultado += f"SITIOS: {', '.join(site_ids)}\n"
+        resultado += f"{'='*120}\n\n"
+        resultado += f"🔎 Búsqueda: '{sitio}'\n"
+        resultado += f"📡 Dispositivos: {', '.join(hostnames)}\n\n"
+        
+        # === CONSULTA 1: Aplicaciones por tráfico ===
+        payload_apps = {
+            "query": {
+                "condition": "AND",
+                "rules": [
+                    {"field": "vdevice_name", "type": "string", "value": system_ips, "operator": "in"}
+                ]
+            },
+            "aggregation": {
+                "field": [
+                    {"property": "application", "size": 200, "sequence": 1}
+                ],
+                "metrics": [
+                    {"property": "octets", "type": "sum"},
+                    {"property": "packets", "type": "sum"}
+                ]
+            }
+        }
+        
+        resp_apps = session.post("/dataservice/statistics/dpi/aggregation", payload_apps, timeout=30)
+        apps = resp_apps.get('data', [])
+        
+        if not apps:
+            return (f"{resultado}❌ No hay datos DPI disponibles para este sitio.\n\n"
+                    f"Verifica que DPI esté habilitado en los dispositivos del sitio.")
+        
+        # Si se filtra por familia, obtener el mapeo app->familia
+        app_familia = {}
+        if familia:
+            payload_fam_app = {
+                "query": {
+                    "condition": "AND",
+                    "rules": [
+                        {"field": "vdevice_name", "type": "string", "value": system_ips, "operator": "in"}
+                    ]
+                },
+                "aggregation": {
+                    "field": [
+                        {"property": "application", "size": 200, "sequence": 1},
+                        {"property": "family", "size": 1, "sequence": 2}
+                    ],
+                    "metrics": [
+                        {"property": "octets", "type": "sum"}
+                    ]
+                }
+            }
+            resp_fam_app = session.post("/dataservice/statistics/dpi/aggregation", payload_fam_app, timeout=30)
+            for item in resp_fam_app.get('data', []):
+                app_familia[item.get('application', '')] = item.get('family', '')
+            
+            familia_lower = familia.lower()
+            apps = [a for a in apps if familia_lower in app_familia.get(a.get('application', ''), '').lower()]
+            
+            if not apps:
+                return f"{resultado}ℹ️  No hay aplicaciones de la familia '{familia}' en este sitio."
+        
+        # Ordenar por octetos
+        apps_sorted = sorted(apps, key=lambda x: int(x.get('octets', 0)), reverse=True)
+        total_bytes = sum(int(a.get('octets', 0)) for a in apps_sorted)
+        
+        if familia:
+            resultado += f"🔍 Filtro: familia = '{familia}'\n"
+        resultado += f"📊 Aplicaciones únicas: {len(apps_sorted)} | Tráfico total: {fmt_bytes(total_bytes)}\n\n"
+        
+        resultado += f"{'#':<4} {'APLICACIÓN':<35} {'TRÁFICO':<14} {'%':<8} {'PAQUETES':<14} {'FLUJOS':<10}\n"
+        resultado += f"{'-'*90}\n"
+        
+        for i, app in enumerate(apps_sorted[:top], 1):
+            octets = int(app.get('octets', 0))
+            packets = int(app.get('packets', 0))
+            count = int(app.get('count', 0))
+            pct = (octets / total_bytes * 100) if total_bytes > 0 else 0
+            nombre = app.get('application', 'N/A')[:33]
+            
+            if pct >= 10: icon = "🔴"
+            elif pct >= 5: icon = "🟠"
+            elif pct >= 1: icon = "🟡"
+            else: icon = "🟢"
+            
+            resultado += f"{i:<4} {icon} {nombre:<33} {fmt_bytes(octets):<14} {pct:>5.1f}%  {packets:<14,} {count:<10,}\n"
+        
+        if len(apps_sorted) > top:
+            otros = len(apps_sorted) - top
+            otros_bytes = sum(int(a.get('octets', 0)) for a in apps_sorted[top:])
+            otros_pct = (otros_bytes / total_bytes * 100) if total_bytes > 0 else 0
+            resultado += f"\n     ... y {otros} aplicaciones más ({fmt_bytes(otros_bytes)}, {otros_pct:.1f}%)\n"
+        
+        # === CONSULTA 2: Resumen por familias ===
+        if not familia:
+            payload_fam = {
+                "query": {
+                    "condition": "AND",
+                    "rules": [
+                        {"field": "vdevice_name", "type": "string", "value": system_ips, "operator": "in"}
+                    ]
+                },
+                "aggregation": {
+                    "field": [
+                        {"property": "family", "size": 50, "sequence": 1}
+                    ],
+                    "metrics": [
+                        {"property": "octets", "type": "sum"},
+                        {"property": "packets", "type": "sum"}
+                    ]
+                }
+            }
+            
+            resp_fam = session.post("/dataservice/statistics/dpi/aggregation", payload_fam, timeout=30)
+            familias_data = resp_fam.get('data', [])
+            
+            if familias_data:
+                fams_sorted = sorted(familias_data, key=lambda x: int(x.get('octets', 0)), reverse=True)
+                total_fam = sum(int(f.get('octets', 0)) for f in fams_sorted)
+                
+                resultado += f"\n{'='*90}\n"
+                resultado += f"📂 RESUMEN POR FAMILIA DE APLICACIÓN:\n\n"
+                resultado += f"{'#':<4} {'FAMILIA':<35} {'TRÁFICO':<14} {'%':<8} {'PAQUETES':<14}\n"
+                resultado += f"{'-'*78}\n"
+                
+                for i, fam in enumerate(fams_sorted, 1):
+                    octets = int(fam.get('octets', 0))
+                    packets = int(fam.get('packets', 0))
+                    pct = (octets / total_fam * 100) if total_fam > 0 else 0
+                    nombre = fam.get('family', 'N/A')[:33]
+                    
+                    if pct >= 10: icon = "🔴"
+                    elif pct >= 5: icon = "🟠"
+                    elif pct >= 1: icon = "🟡"
+                    else: icon = "🟢"
+                    
+                    resultado += f"{i:<4} {icon} {nombre:<33} {fmt_bytes(octets):<14} {pct:>5.1f}%  {packets:<14,}\n"
+        
+        resultado += f"\n{'='*90}\n"
+        resultado += f"💡 HERRAMIENTAS RELACIONADAS:\n"
+        resultado += f"  • ver_aplicaciones_sitio('{site_ids[0]}', familia='audio-video') — Filtrar por familia\n"
+        resultado += f"  • ver_saturacion_sitio('{site_ids[0]}') — Saturación de enlaces WAN del sitio\n"
+        resultado += f"  • obtener_ips_destino_aplicacion('google-services') — IPs destino de una app\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener aplicaciones del sitio: {str(e)}"
+
+
+@mcp.tool()
 def obtener_flujos_dpi_sitio(sitio: str, aplicacion: str = "") -> str:
     """
     Obtiene información de flujos DPI de un sitio específico usando vManage API.
