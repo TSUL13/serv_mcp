@@ -15,6 +15,7 @@ import base64
 import threading
 import time
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -2511,34 +2512,33 @@ def catalyst_resumen_red() -> str:
 @mcp.tool()
 def top_sitios_saturados(
     top: int = 20,
-    max_dispositivos: int = 50,
-    todos: bool = False,
     umbral_pct: float = 0.0
 ) -> str:
     """
-    Identifica los sitios SD-WAN más saturados consultando las interfaces de los dispositivos en tiempo real.
-    Calcula el porcentaje de utilización de cada enlace WAN (VPN 0) comparando el tráfico actual (kbps) 
-    contra la velocidad del enlace (speed-mbps).
+    Identifica los sitios SD-WAN más saturados consultando las interfaces WAN de TODOS 
+    los dispositivos en tiempo real usando consultas paralelas.
+    
+    Calcula el porcentaje de utilización de cada enlace WAN (VPN 0) comparando 
+    el tráfico actual (kbps) contra la velocidad del enlace (speed-mbps).
+    Analiza los ~325 dispositivos en ~30-40 segundos gracias a consultas concurrentes.
     
     Args:
         top: Número de sitios más saturados a mostrar (default: 20)
-        max_dispositivos: Número máximo de dispositivos a consultar para agilizar (default: 50, máximo recomendado: 100)
-        todos: Si True, consulta TODOS los dispositivos (~325). LENTO: puede tardar 4-5 minutos (default: False)
         umbral_pct: Solo mostrar interfaces con utilización mayor a este porcentaje (default: 0.0)
     
     Returns:
-        Ranking de sitios por saturación con detalle de interfaces, tráfico y % de utilización
+        Ranking de sitios por saturación con detalle de interfaces, tráfico y % de utilización.
+        Incluye estadísticas globales de toda la red.
     
     Ejemplo:
-        top_sitios_saturados() - Top 20 sitios más saturados (muestreo rápido de 50 dispositivos)
-        top_sitios_saturados(todos=True) - Analizar TODOS los dispositivos (~4 min)
+        top_sitios_saturados() - Top 20 sitios más saturados (analiza TODOS los dispositivos)
         top_sitios_saturados(top=10, umbral_pct=10) - Solo sitios con más de 10% de utilización
     """
     try:
         import time as time_mod
         start_time = time_mod.time()
         
-        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Analizando saturación de sitios...", file=sys.stderr)
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Analizando saturación de TODOS los sitios (consultas paralelas)...", file=sys.stderr)
         
         session = get_vmanage_session()
         
@@ -2552,32 +2552,22 @@ def top_sitios_saturados(
         if not vedges:
             return "❌ No se encontraron dispositivos WAN Edge alcanzables"
         
-        # Determinar cuántos consultar
-        if todos:
-            devices_to_query = vedges
-        else:
-            devices_to_query = vedges[:max_dispositivos]
-        
-        total_to_query = len(devices_to_query)
+        total_to_query = len(vedges)
         
         resultado = f"📊 ANÁLISIS DE SATURACIÓN DE SITIOS SD-WAN\n"
         resultado += f"{'='*110}\n\n"
-        resultado += f"🔎 Modo: {'COMPLETO (todos los dispositivos)' if todos else f'Muestreo ({total_to_query} de {len(vedges)} dispositivos)'}\n"
-        resultado += f"📡 WAN Edges alcanzables: {len(vedges)}\n"
-        resultado += f"🕐 Análisis en tiempo real...\n\n"
+        resultado += f"🔎 Modo: COMPLETO — Analizando TODOS los {total_to_query} dispositivos en paralelo\n"
+        resultado += f"📡 WAN Edges alcanzables: {total_to_query}\n\n"
         
-        # Consultar interfaces de cada dispositivo
-        sitios = {}
-        errores = 0
-        consultados = 0
-        
-        for dev in devices_to_query:
+        # Función para consultar un dispositivo individual
+        def consultar_dispositivo(dev):
             dev_id = dev.get('deviceId') or dev.get('system-ip', '')
             hostname = dev.get('host-name', '')
             site_id = str(dev.get('site-id', 'N/A'))
+            interfaces_result = []
             
             try:
-                resp = session.get(f"/dataservice/device/interface?deviceId={dev_id}", timeout=10)
+                resp = session.get(f"/dataservice/device/interface?deviceId={dev_id}", timeout=15)
                 ifaces = resp.get('data', [])
                 
                 for iface in ifaces:
@@ -2587,7 +2577,6 @@ def top_sitios_saturados(
                     
                     if str(vpn) != '0' or 'ready' not in oper_status.lower():
                         continue
-                    
                     if ifname.lower().startswith(('loopback', 'system', 'sdwan_')):
                         continue
                     
@@ -2603,31 +2592,12 @@ def top_sitios_saturados(
                         if speed_kbps > 0:
                             utilization = ((rx_kbps + tx_kbps) / speed_kbps) * 100
                     
-                    if utilization < umbral_pct and rx_kbps + tx_kbps == 0:
+                    if rx_kbps + tx_kbps == 0:
                         continue
                     
-                    if site_id not in sitios:
-                        sitios[site_id] = {
-                            'interfaces': [],
-                            'hostnames': set(),
-                            'max_util': 0.0,
-                            'total_rx_kbps': 0,
-                            'total_tx_kbps': 0,
-                            'total_rx_gb': 0.0,
-                            'total_tx_gb': 0.0
-                        }
-                    
-                    sitios[site_id]['hostnames'].add(hostname)
-                    sitios[site_id]['total_rx_kbps'] += rx_kbps
-                    sitios[site_id]['total_tx_kbps'] += tx_kbps
-                    sitios[site_id]['total_rx_gb'] += rx_octets / (1024**3)
-                    sitios[site_id]['total_tx_gb'] += tx_octets / (1024**3)
-                    
-                    if utilization > sitios[site_id]['max_util']:
-                        sitios[site_id]['max_util'] = utilization
-                    
-                    sitios[site_id]['interfaces'].append({
+                    interfaces_result.append({
                         'hostname': hostname,
+                        'site_id': site_id,
                         'ifname': ifname,
                         'rx_kbps': rx_kbps,
                         'tx_kbps': tx_kbps,
@@ -2638,18 +2608,61 @@ def top_sitios_saturados(
                         'description': iface.get('description', '')
                     })
                 
-                consultados += 1
-                if consultados % 20 == 0:
-                    print(f"   ... {consultados}/{total_to_query} dispositivos consultados", file=sys.stderr)
-                    
+                return {'ok': True, 'interfaces': interfaces_result}
             except Exception as e:
-                errores += 1
-                print(f"   ⚠️ Error en {hostname}: {str(e)[:50]}", file=sys.stderr)
+                return {'ok': False, 'error': str(e)[:50], 'hostname': hostname}
+        
+        # Consultas paralelas con ThreadPoolExecutor
+        resultados_devices = []
+        errores = 0
+        consultados = 0
+        
+        # Limitar concurrencia a 10 para no saturar vManage
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(consultar_dispositivo, dev): dev for dev in vedges}
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result['ok']:
+                    resultados_devices.extend(result['interfaces'])
+                    consultados += 1
+                else:
+                    errores += 1
+                    print(f"   ⚠️ Error en {result.get('hostname', '?')}: {result.get('error', '?')}", file=sys.stderr)
+                
+                if (consultados + errores) % 50 == 0:
+                    print(f"   ... {consultados + errores}/{total_to_query} dispositivos procesados", file=sys.stderr)
         
         elapsed = time_mod.time() - start_time
         
-        if not sitios:
-            return f"❌ No se encontraron interfaces con datos de tráfico\n\nTiempo: {elapsed:.1f}s | Dispositivos consultados: {consultados} | Errores: {errores}"
+        if not resultados_devices:
+            return f"❌ No se encontraron interfaces con datos de tráfico\n\nTiempo: {elapsed:.1f}s | Consultados: {consultados} | Errores: {errores}"
+        
+        # Agregar por sitio
+        sitios = {}
+        for iface in resultados_devices:
+            site_id = iface['site_id']
+            if site_id not in sitios:
+                sitios[site_id] = {
+                    'interfaces': [],
+                    'hostnames': set(),
+                    'max_util': 0.0,
+                    'total_rx_kbps': 0,
+                    'total_tx_kbps': 0,
+                    'total_rx_gb': 0.0,
+                    'total_tx_gb': 0.0
+                }
+            
+            sitios[site_id]['hostnames'].add(iface['hostname'])
+            sitios[site_id]['total_rx_kbps'] += iface['rx_kbps']
+            sitios[site_id]['total_tx_kbps'] += iface['tx_kbps']
+            sitios[site_id]['total_rx_gb'] += iface['rx_gb']
+            sitios[site_id]['total_tx_gb'] += iface['tx_gb']
+            
+            if iface['utilization'] > sitios[site_id]['max_util']:
+                sitios[site_id]['max_util'] = iface['utilization']
+            
+            sitios[site_id]['interfaces'].append(iface)
         
         def fmt_kbps(kbps):
             if kbps > 1000000:
@@ -2668,17 +2681,17 @@ def top_sitios_saturados(
         if umbral_pct > 0:
             sorted_sites = [(s, d) for s, d in sorted_sites if d['max_util'] >= umbral_pct]
         
-        resultado += f"⏱️  Tiempo de análisis: {elapsed:.1f}s\n"
-        resultado += f"✅ Dispositivos consultados: {consultados}\n"
+        resultado += f"⏱️  Tiempo de análisis: {elapsed:.1f}s ({total_to_query} dispositivos en paralelo)\n"
+        resultado += f"✅ Dispositivos consultados: {consultados} de {total_to_query}\n"
         if errores > 0:
             resultado += f"⚠️  Errores: {errores}\n"
         resultado += f"🏢 Sitios con tráfico: {len(sitios)}\n\n"
         
         # === RANKING DE SITIOS ===
-        resultado += f"{'='*110}\n"
+        resultado += f"{'='*120}\n"
         resultado += f"🔝 TOP {min(top, len(sorted_sites))} SITIOS MÁS SATURADOS:\n\n"
         resultado += f"{'#':<4} {'SITIO':<10} {'MAX %':<8} {'TRÁFICO ACTUAL':<22} {'ACUMULADO':<22} {'DISPOSITIVOS':<30} {'IFACES':<8}\n"
-        resultado += f"{'-'*110}\n"
+        resultado += f"{'-'*120}\n"
         
         for i, (site_id, data) in enumerate(sorted_sites[:top], 1):
             total_actual = data['total_rx_kbps'] + data['total_tx_kbps']
@@ -2697,15 +2710,24 @@ def top_sitios_saturados(
                 icon = "🟢"
             
             resultado += f"{i:<4} {site_id:<10} {icon}{max_util:>5.1f}% {fmt_kbps(total_actual):<22} {fmt_gb(total_acum):<22} {hostnames:<30} {num_ifaces:<8}\n"
+            
+            # Detalle de interfaces físicas del sitio (sin tunnels, ordenadas por utilización)
+            ifaces_fisicas = [ifc for ifc in data['interfaces'] if not ifc['ifname'].lower().startswith('tunnel')]
+            ifaces_sorted = sorted(ifaces_fisicas, key=lambda x: x['utilization'], reverse=True)
+            resultado += f"{'':5} {'INTERFAZ':<22} {'RX':<14} {'TX':<14} {'SPEED':<12} {'% USO':<8} {'DESCRIPCIÓN'}\n"
+            for ifc in ifaces_sorted:
+                u = ifc['utilization']
+                if u >= 80: ic = "🔴"
+                elif u >= 50: ic = "🟠"
+                elif u >= 20: ic = "🟡"
+                else: ic = "🟢"
+                spd = f"{ifc['speed_mbps']} Mbps" if ifc['speed_mbps'] != 'N/A' else 'N/A'
+                desc = ifc.get('description', '') or ''
+                resultado += f"{'':5} {ifc['ifname']:<22} {fmt_kbps(ifc['rx_kbps']):<14} {fmt_kbps(ifc['tx_kbps']):<14} {spd:<12} {ic}{u:>5.1f}% {desc}\n"
+            resultado += f"\n"
         
         # === DETALLE DE INTERFACES MÁS SATURADAS ===
-        all_interfaces = []
-        for site_id, data in sitios.items():
-            for iface in data['interfaces']:
-                iface['site_id'] = site_id
-                all_interfaces.append(iface)
-        
-        all_interfaces.sort(key=lambda x: x['utilization'], reverse=True)
+        all_interfaces = sorted(resultados_devices, key=lambda x: x['utilization'], reverse=True)
         top_ifaces = [i for i in all_interfaces if i['utilization'] >= max(umbral_pct, 1.0)][:25]
         
         if top_ifaces:
@@ -2753,13 +2775,9 @@ def top_sitios_saturados(
         resultado += f"  🟡 Sitios medios (20-50%):  {sitios_medios}\n"
         resultado += f"  🟢 Sitios bajos (<20%):     {sitios_bajos}\n"
         
-        if not todos and len(vedges) > max_dispositivos:
-            resultado += f"\n⚠️  NOTA: Solo se consultaron {consultados} de {len(vedges)} dispositivos.\n"
-            resultado += f"   Para un análisis completo usa: top_sitios_saturados(todos=True)\n"
-            resultado += f"   Esto tardará aproximadamente {len(vedges) * 0.8:.0f} segundos.\n"
-        
         resultado += f"\n💡 Leyenda: 🔴 ≥80% | 🟠 50-80% | 🟡 20-50% | 🟢 <20%\n"
         resultado += f"💡 % USO = (Rx + Tx kbps) / (Speed kbps) × 100 — interfaces VPN 0 (transporte)\n"
+        resultado += f"💡 Análisis de {consultados} dispositivos completado en {elapsed:.1f}s\n"
         
         return resultado
         
