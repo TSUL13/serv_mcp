@@ -2786,6 +2786,205 @@ def top_sitios_saturados(
 
 
 @mcp.tool()
+def ver_saturacion_sitio(sitio: str) -> str:
+    """
+    Muestra la saturación en tiempo real de un sitio SD-WAN específico.
+    Consulta las interfaces WAN (VPN 0) de TODOS los dispositivos del sitio
+    y calcula el porcentaje de utilización de cada enlace.
+    
+    Args:
+        sitio: ID del sitio, nombre parcial o hostname de un dispositivo del sitio
+               (ej: "51304", "304", "SDWAN-CJF-304-RT01")
+    
+    Returns:
+        Detalle completo del sitio: dispositivos, interfaces WAN, tráfico Rx/Tx,
+        velocidad del enlace, % de utilización y descripción.
+    
+    Ejemplo:
+        ver_saturacion_sitio("51304") - Saturación del sitio 51304
+        ver_saturacion_sitio("304") - Busca sitios que contengan "304"
+        ver_saturacion_sitio("SDWAN-CJF-304-RT01") - Por hostname del dispositivo
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Analizando saturación del sitio: {sitio}", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Obtener todos los dispositivos
+        devices_result = session.get("/dataservice/device")
+        all_devices = devices_result.get('data', [])
+        
+        # Buscar dispositivos del sitio por site-id, hostname o nombre parcial
+        sitio_lower = sitio.strip().lower()
+        site_devices = []
+        
+        for dev in all_devices:
+            if dev.get('device-type') != 'vedge' or dev.get('reachability') != 'reachable':
+                continue
+            
+            dev_site_id = str(dev.get('site-id', ''))
+            dev_hostname = dev.get('host-name', '').lower()
+            
+            # Coincidencia exacta por site-id
+            if sitio_lower == dev_site_id.lower():
+                site_devices.append(dev)
+            # Coincidencia parcial por site-id (ej: "304" matchea "51304")
+            elif sitio_lower in dev_site_id:
+                site_devices.append(dev)
+            # Coincidencia por hostname
+            elif sitio_lower in dev_hostname:
+                site_devices.append(dev)
+        
+        if not site_devices:
+            return (f"❌ No se encontraron dispositivos WAN Edge para el sitio '{sitio}'\n\n"
+                    f"Intenta con:\n"
+                    f"  • ID del sitio: ver_saturacion_sitio('51304')\n"
+                    f"  • Parcial: ver_saturacion_sitio('304')\n"
+                    f"  • Hostname: ver_saturacion_sitio('SDWAN-CJF-304-RT01')")
+        
+        # Verificar si hay dispositivos de múltiples sitios (búsqueda parcial ambigua)
+        site_ids_encontrados = set(str(d.get('site-id', '')) for d in site_devices)
+        
+        resultado = f"📊 SATURACIÓN EN TIEMPO REAL — "
+        if len(site_ids_encontrados) == 1:
+            resultado += f"SITIO {list(site_ids_encontrados)[0]}\n"
+        else:
+            resultado += f"SITIOS: {', '.join(sorted(site_ids_encontrados))}\n"
+        resultado += f"{'='*120}\n\n"
+        resultado += f"🔎 Búsqueda: '{sitio}'\n"
+        resultado += f"📡 Dispositivos encontrados: {len(site_devices)}\n\n"
+        
+        def fmt_kbps(kbps):
+            if kbps > 1000000:
+                return f"{kbps / 1000000:.1f} Gbps"
+            if kbps > 1000:
+                return f"{kbps / 1000:.1f} Mbps"
+            return f"{kbps} kbps"
+        
+        def fmt_gb(gb):
+            if gb > 1024:
+                return f"{gb / 1024:.1f} TB"
+            return f"{gb:.1f} GB"
+        
+        total_interfaces = 0
+        max_util_global = 0.0
+        total_rx_kbps = 0
+        total_tx_kbps = 0
+        
+        for dev in site_devices:
+            dev_id = dev.get('deviceId') or dev.get('system-ip', '')
+            hostname = dev.get('host-name', '')
+            system_ip = dev.get('system-ip', '')
+            dev_site_id = str(dev.get('site-id', ''))
+            dev_model = dev.get('device-model', '')
+            
+            resultado += f"{'─'*120}\n"
+            resultado += f"🖥️  {hostname} | System IP: {system_ip} | Site: {dev_site_id} | Modelo: {dev_model}\n"
+            resultado += f"{'─'*120}\n"
+            
+            try:
+                resp = session.get(f"/dataservice/device/interface?deviceId={dev_id}", timeout=15)
+                ifaces = resp.get('data', [])
+                
+                wan_ifaces = []
+                for iface in ifaces:
+                    vpn = iface.get('vpn-id')
+                    oper_status = iface.get('if-oper-status', '')
+                    ifname = iface.get('ifname', '')
+                    
+                    if str(vpn) != '0':
+                        continue
+                    if ifname.lower().startswith(('loopback', 'system', 'sdwan', 'tunnel', 'nvi', 'vmanage')):
+                        continue
+                    
+                    rx_kbps = int(iface.get('rx-kbps', 0) or 0)
+                    tx_kbps = int(iface.get('tx-kbps', 0) or 0)
+                    speed_mbps = iface.get('speed-mbps', 0)
+                    rx_octets = int(iface.get('rx-octets', 0) or 0)
+                    tx_octets = int(iface.get('tx-octets', 0) or 0)
+                    
+                    is_up = 'ready' in oper_status.lower()
+                    
+                    # Omitir interfaces DOWN sin tráfico acumulado
+                    if not is_up and rx_kbps + tx_kbps == 0 and rx_octets + tx_octets == 0:
+                        continue
+                    
+                    utilization = 0.0
+                    if speed_mbps and speed_mbps != 'N/A':
+                        speed_kbps = int(speed_mbps) * 1000
+                        if speed_kbps > 0:
+                            utilization = ((rx_kbps + tx_kbps) / speed_kbps) * 100
+                    
+                    wan_ifaces.append({
+                        'ifname': ifname,
+                        'rx_kbps': rx_kbps,
+                        'tx_kbps': tx_kbps,
+                        'speed_mbps': speed_mbps,
+                        'utilization': utilization,
+                        'rx_gb': rx_octets / (1024**3),
+                        'tx_gb': tx_octets / (1024**3),
+                        'description': iface.get('description', '') or '',
+                        'is_up': is_up,
+                        'oper_status': oper_status,
+                        'ip_address': iface.get('ip-address', 'N/A')
+                    })
+                
+                wan_ifaces.sort(key=lambda x: x['utilization'], reverse=True)
+                
+                if not wan_ifaces:
+                    resultado += f"  ⚠️  Sin interfaces WAN físicas en VPN 0\n\n"
+                    continue
+                
+                resultado += f"  {'INTERFAZ':<25} {'ESTADO':<10} {'RX':<14} {'TX':<14} {'SPEED':<12} {'% USO':<10} {'ACUM RX':<12} {'ACUM TX':<12} {'DESCRIPCIÓN'}\n"
+                resultado += f"  {'-'*115}\n"
+                
+                for ifc in wan_ifaces:
+                    u = ifc['utilization']
+                    if u >= 80: ic = "🔴"
+                    elif u >= 50: ic = "🟠"
+                    elif u >= 20: ic = "🟡"
+                    else: ic = "🟢"
+                    
+                    status = "🟢 UP" if ifc['is_up'] else "🔴 DOWN"
+                    spd = f"{ifc['speed_mbps']} Mbps" if ifc['speed_mbps'] != 'N/A' else 'N/A'
+                    
+                    resultado += f"  {ifc['ifname']:<25} {status:<10} {fmt_kbps(ifc['rx_kbps']):<14} {fmt_kbps(ifc['tx_kbps']):<14} {spd:<12} {ic}{u:>5.1f}%   {fmt_gb(ifc['rx_gb']):<12} {fmt_gb(ifc['tx_gb']):<12} {ifc['description']}\n"
+                    
+                    total_interfaces += 1
+                    total_rx_kbps += ifc['rx_kbps']
+                    total_tx_kbps += ifc['tx_kbps']
+                    if u > max_util_global:
+                        max_util_global = u
+                
+                resultado += f"\n"
+                
+            except Exception as e:
+                resultado += f"  ❌ Error al consultar: {str(e)[:80]}\n\n"
+        
+        # Resumen del sitio
+        if max_util_global >= 80: icon = "🔴 CRÍTICO"
+        elif max_util_global >= 50: icon = "🟠 ALTO"
+        elif max_util_global >= 20: icon = "🟡 MEDIO"
+        else: icon = "🟢 BAJO"
+        
+        resultado += f"{'='*120}\n"
+        resultado += f"📈 RESUMEN DEL SITIO:\n\n"
+        resultado += f"  📡 Dispositivos:           {len(site_devices)}\n"
+        resultado += f"  🔌 Interfaces WAN:         {total_interfaces}\n"
+        resultado += f"  📥 Tráfico Rx total:       {fmt_kbps(total_rx_kbps)}\n"
+        resultado += f"  📤 Tráfico Tx total:       {fmt_kbps(total_tx_kbps)}\n"
+        resultado += f"  📊 Tráfico total:          {fmt_kbps(total_rx_kbps + total_tx_kbps)}\n"
+        resultado += f"  🎯 Saturación máxima:      {max_util_global:.1f}% — {icon}\n\n"
+        resultado += f"💡 % USO = (Rx + Tx kbps) / (Speed kbps) × 100 — interfaces VPN 0 (transporte)\n"
+        resultado += f"💡 Leyenda: 🔴 ≥80% | 🟠 50-80% | 🟡 20-50% | 🟢 <20%\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al analizar saturación del sitio: {str(e)}"
+
+
+@mcp.tool()
 def obtener_flujos_dpi_sitio(sitio: str, aplicacion: str = "") -> str:
     """
     Obtiene información de flujos DPI de un sitio específico usando vManage API.
