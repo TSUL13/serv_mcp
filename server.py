@@ -4380,6 +4380,750 @@ def ver_sla_tuneles(
         return f"❌ Error al obtener SLA de túneles: {str(e)}"
 
 
+# =====================================================
+# HERRAMIENTA 34: DPI RED COMPLETA — Top apps/familias
+# =====================================================
+@mcp.tool()
+def ver_dpi_red_completa(
+    top: int = 40,
+    familia: str = "",
+    horas: int = 24
+) -> str:
+    """
+    Análisis DPI de TODA la red SD-WAN — muestra las aplicaciones que más ancho de banda consumen
+    en todos los sitios, con ranking por tráfico, familias, y distribución por sitio.
+    Usa la API de agregación que es la misma fuente de datos que Analytics/vAnalytics.
+
+    Args:
+        top: Número de aplicaciones a mostrar en el ranking (default: 40)
+        familia: (Opcional) Filtrar por familia de aplicación (ej: "web", "audio-video", "encrypted", "tunneling")
+        horas: Ventana de tiempo en horas (default: 24, máx 720 = 30 días)
+
+    Returns:
+        Ranking global de aplicaciones por consumo, resumen por familia, y top sitios por tráfico.
+        Incluye detección de aplicaciones no deseadas (torrent, tor, etc.)
+
+    Ejemplo:
+        ver_dpi_red_completa() — Top 40 apps de toda la red (últimas 24h)
+        ver_dpi_red_completa(top=20, familia="audio-video") — Solo audio/video
+        ver_dpi_red_completa(horas=168) — Última semana
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Analizando DPI de toda la red ({horas}h)...", file=sys.stderr)
+        from collections import defaultdict
+
+        session = get_vmanage_session()
+
+        def fmt_bytes(b):
+            try: b = int(b)
+            except: return str(b)
+            if b > 1024**4: return f"{b / (1024**4):.2f} TB"
+            if b > 1024**3: return f"{b / (1024**3):.2f} GB"
+            if b > 1024**2: return f"{b / (1024**2):.1f} MB"
+            if b > 1024: return f"{b / 1024:.1f} KB"
+            return f"{b} B"
+
+        # Limitar horas
+        horas = max(1, min(horas, 720))
+
+        # ── 1. Aplicaciones globales ──
+        payload_apps = {
+            "query": {"condition": "AND", "rules": []},
+            "aggregation": {
+                "field": [{"property": "application", "size": 500, "sequence": 1}],
+                "metrics": [
+                    {"property": "octets", "type": "sum"},
+                    {"property": "packets", "type": "sum"}
+                ]
+            }
+        }
+        if horas != 24:
+            payload_apps["query"]["rules"].append(
+                {"field": "entry_time", "type": "date", "value": [str(horas)], "operator": "last_n_hours"}
+            )
+
+        resp_apps = session.post("/dataservice/statistics/dpi/aggregation", payload_apps, timeout=60)
+        apps_data = resp_apps.get('data', [])
+
+        if not apps_data:
+            return ("❌ No hay datos DPI de agregación disponibles para la red.\n\n"
+                    "Posibles causas:\n"
+                    "  1. DPI/NBAR no está habilitado en los dispositivos\n"
+                    "  2. No hay Data Policy aplicada para clasificación\n"
+                    "  3. Los dispositivos no envían estadísticas a vManage")
+
+        # ── 2. Familias globales ──
+        payload_fam = {
+            "query": {"condition": "AND", "rules": []},
+            "aggregation": {
+                "field": [{"property": "family", "size": 100, "sequence": 1}],
+                "metrics": [
+                    {"property": "octets", "type": "sum"},
+                    {"property": "packets", "type": "sum"}
+                ]
+            }
+        }
+        if horas != 24:
+            payload_fam["query"]["rules"].append(
+                {"field": "entry_time", "type": "date", "value": [str(horas)], "operator": "last_n_hours"}
+            )
+
+        resp_fam = session.post("/dataservice/statistics/dpi/aggregation", payload_fam, timeout=60)
+        fam_data = resp_fam.get('data', [])
+
+        # ── 3. Top sitios (por vdevice_name agrupado) ──
+        payload_sites = {
+            "query": {"condition": "AND", "rules": []},
+            "aggregation": {
+                "field": [{"property": "vdevice_name", "size": 400, "sequence": 1}],
+                "metrics": [
+                    {"property": "octets", "type": "sum"},
+                    {"property": "packets", "type": "sum"}
+                ]
+            }
+        }
+        if horas != 24:
+            payload_sites["query"]["rules"].append(
+                {"field": "entry_time", "type": "date", "value": [str(horas)], "operator": "last_n_hours"}
+            )
+
+        resp_sites = session.post("/dataservice/statistics/dpi/aggregation", payload_sites, timeout=60)
+        sites_data = resp_sites.get('data', [])
+
+        # Mapear system_ip → hostname + site_id
+        devices_result = session.get("/dataservice/device")
+        dev_map = {}
+        for dev in devices_result.get('data', []):
+            sip = dev.get('system-ip', '')
+            dev_map[sip] = {
+                'hostname': dev.get('host-name', sip),
+                'site_id': str(dev.get('site-id', 'N/A'))
+            }
+
+        # ── Filtrar por familia si se especificó ──
+        if familia:
+            fam_lower = familia.strip().lower()
+            # Necesitamos mapeo app→family
+            payload_app_fam = {
+                "query": {"condition": "AND", "rules": []},
+                "aggregation": {
+                    "field": [
+                        {"property": "application", "size": 500, "sequence": 1},
+                        {"property": "family", "size": 1, "sequence": 2}
+                    ],
+                    "metrics": [{"property": "octets", "type": "sum"}]
+                }
+            }
+            if horas != 24:
+                payload_app_fam["query"]["rules"].append(
+                    {"field": "entry_time", "type": "date", "value": [str(horas)], "operator": "last_n_hours"}
+                )
+            resp_af = session.post("/dataservice/statistics/dpi/aggregation", payload_app_fam, timeout=60)
+            app_fam_map = {}
+            for item in resp_af.get('data', []):
+                app_fam_map[item.get('application', '')] = item.get('family', '')
+
+            apps_data = [a for a in apps_data if fam_lower in app_fam_map.get(a.get('application', ''), '').lower()]
+            if not apps_data:
+                return f"❌ No hay aplicaciones de la familia '{familia}' en los datos DPI."
+
+        # ── Construir resultado ──
+        apps_sorted = sorted(apps_data, key=lambda x: int(x.get('octets', 0)), reverse=True)
+        total_bytes = sum(int(a.get('octets', 0)) for a in apps_sorted)
+
+        resultado = f"🌐 DPI RED COMPLETA — ANÁLISIS GLOBAL DE APLICACIONES\n"
+        resultado += f"{'='*120}\n\n"
+        resultado += f"⏰ Ventana de análisis: últimas {horas} hora(s)\n"
+        resultado += f"📊 Aplicaciones únicas: {len(apps_sorted)} | Tráfico total clasificado: {fmt_bytes(total_bytes)}\n"
+        if familia:
+            resultado += f"🔍 Filtro: familia = '{familia}'\n"
+        resultado += f"\n"
+
+        # ── RANKING DE APLICACIONES ──
+        resultado += f"{'#':<5} {'APLICACIÓN':<35} {'TRÁFICO':<14} {'%':<8} {'PAQUETES':<16}\n"
+        resultado += f"{'-'*82}\n"
+
+        # Apps no deseadas / sospechosas
+        apps_sospechosas = {'torrent', 'bittorrent', 'tor', 'ultrasurf', 'psiphon', 'tunnelbear',
+                            'openvpn', 'wireguard', 'shadowsocks', 'v2ray', 'crypto-mining'}
+
+        alertas = []
+        for i, app in enumerate(apps_sorted[:top], 1):
+            octets = int(app.get('octets', 0))
+            packets = int(app.get('packets', 0))
+            nombre = app.get('application', 'N/A')
+            pct = (octets / total_bytes * 100) if total_bytes > 0 else 0
+
+            if pct >= 10: icon = "🔴"
+            elif pct >= 5: icon = "🟠"
+            elif pct >= 1: icon = "🟡"
+            else: icon = "🟢"
+
+            alerta = ""
+            if nombre.lower() in apps_sospechosas or any(s in nombre.lower() for s in apps_sospechosas):
+                alerta = " ⚠️ SOSPECHOSA"
+                alertas.append(nombre)
+
+            resultado += f"{i:<5} {icon} {nombre:<33} {fmt_bytes(octets):<14} {pct:>5.1f}%  {packets:<16,}{alerta}\n"
+
+        if len(apps_sorted) > top:
+            otros = len(apps_sorted) - top
+            otros_bytes = sum(int(a.get('octets', 0)) for a in apps_sorted[top:])
+            resultado += f"\n      ... y {otros} aplicaciones más ({fmt_bytes(otros_bytes)}, {(otros_bytes/total_bytes*100):.1f}%)\n"
+
+        # ── RESUMEN POR FAMILIA ──
+        if fam_data and not familia:
+            fams_sorted = sorted(fam_data, key=lambda x: int(x.get('octets', 0)), reverse=True)
+            total_fam = sum(int(f.get('octets', 0)) for f in fams_sorted)
+
+            resultado += f"\n{'='*120}\n"
+            resultado += f"📂 DISTRIBUCIÓN POR FAMILIA DE APLICACIÓN:\n\n"
+            resultado += f"{'#':<5} {'FAMILIA':<35} {'TRÁFICO':<14} {'%':<8} {'PAQUETES':<16}\n"
+            resultado += f"{'-'*82}\n"
+
+            for i, fam in enumerate(fams_sorted, 1):
+                octets = int(fam.get('octets', 0))
+                packets = int(fam.get('packets', 0))
+                pct = (octets / total_fam * 100) if total_fam > 0 else 0
+                nombre = fam.get('family', 'N/A')
+
+                if pct >= 10: icon = "🔴"
+                elif pct >= 5: icon = "🟠"
+                elif pct >= 1: icon = "🟡"
+                else: icon = "🟢"
+
+                resultado += f"{i:<5} {icon} {nombre:<33} {fmt_bytes(octets):<14} {pct:>5.1f}%  {packets:<16,}\n"
+
+        # ── TOP SITIOS POR TRÁFICO DPI ──
+        if sites_data:
+            # Agrupar por site_id
+            site_agg = defaultdict(lambda: {'bytes': 0, 'packets': 0, 'devices': []})
+            for sd in sites_data:
+                sip = sd.get('vdevice_name', '')
+                info = dev_map.get(sip, {'hostname': sip, 'site_id': 'N/A'})
+                sid = info['site_id']
+                site_agg[sid]['bytes'] += int(sd.get('octets', 0))
+                site_agg[sid]['packets'] += int(sd.get('packets', 0))
+                site_agg[sid]['devices'].append(info['hostname'])
+
+            sites_ranked = sorted(site_agg.items(), key=lambda x: x[1]['bytes'], reverse=True)
+
+            resultado += f"\n{'='*120}\n"
+            resultado += f"🏢 TOP 30 SITIOS POR TRÁFICO DPI:\n\n"
+            resultado += f"{'#':<5} {'SITE ID':<12} {'TRÁFICO':<14} {'%':<8} {'DISPOSITIVOS':<60}\n"
+            resultado += f"{'-'*100}\n"
+
+            for i, (sid, data) in enumerate(sites_ranked[:30], 1):
+                pct = (data['bytes'] / total_bytes * 100) if total_bytes > 0 else 0
+                devs = ', '.join(sorted(set(data['devices'])))[:58]
+
+                if pct >= 5: icon = "🔴"
+                elif pct >= 2: icon = "🟠"
+                elif pct >= 0.5: icon = "🟡"
+                else: icon = "🟢"
+
+                resultado += f"{i:<5} {icon} {sid:<10} {fmt_bytes(data['bytes']):<14} {pct:>5.1f}%  {devs}\n"
+
+            resultado += f"\n      Total sitios con tráfico DPI: {len(sites_ranked)}\n"
+
+        # ── ALERTAS ──
+        if alertas:
+            resultado += f"\n{'='*120}\n"
+            resultado += f"🚨 ALERTAS — APLICACIONES SOSPECHOSAS DETECTADAS:\n\n"
+            for app_name in alertas:
+                resultado += f"  ⚠️  {app_name} — Puede ser tráfico no autorizado (P2P, proxy, evasión)\n"
+            resultado += f"\n  💡 Usa ver_aplicaciones_sitio(sitio) para identificar qué sitios generan este tráfico\n"
+            resultado += f"  💡 Usa ver_flujos_dpi_detalle(aplicacion='{alertas[0]}') para ver IPs origen/destino\n"
+
+        resultado += f"\n{'='*120}\n"
+        resultado += f"💡 HERRAMIENTAS RELACIONADAS:\n"
+        resultado += f"  • ver_aplicaciones_sitio('51318') — DPI detallado de un sitio específico\n"
+        resultado += f"  • ver_flujos_dpi_detalle(sitio='318') — Flujos con IPs origen/destino\n"
+        resultado += f"  • ver_top_consumidores_dpi(aplicacion='youtube') — Quién consume más una app\n"
+        resultado += f"  • ver_dpi_red_completa(familia='audio-video') — Solo una familia\n"
+
+        return resultado
+
+    except Exception as e:
+        return f"❌ Error al analizar DPI de la red: {str(e)}"
+
+
+# =====================================================
+# HERRAMIENTA 35: FLUJOS DPI DETALLADOS (IPs y puertos)
+# =====================================================
+@mcp.tool()
+def ver_flujos_dpi_detalle(
+    sitio: str = "",
+    aplicacion: str = "",
+    top: int = 50
+) -> str:
+    """
+    Muestra flujos DPI detallados con IPs origen/destino, puertos, protocolos e interfaces.
+    Usa POST a la API de estadísticas DPI para obtener datos de CUALQUIER sitio (no solo CJF-304).
+
+    Args:
+        sitio: (Opcional) ID del sitio, parcial o hostname (ej: "318", "51318", "SDWAN-CJF-318-RT01")
+        aplicacion: (Opcional) Filtrar por aplicación (ej: "youtube", "ms-teams", "torrent")
+        top: Número de flujos a mostrar (default: 50)
+
+    Returns:
+        Tabla de flujos con IP origen, IP destino, puertos, protocolo, bytes, interfaz y aplicación.
+        Incluye resumen de top IPs destino, top IPs origen, y top puertos.
+
+    Ejemplo:
+        ver_flujos_dpi_detalle(sitio="318") — Todos los flujos del sitio 318
+        ver_flujos_dpi_detalle(sitio="318", aplicacion="youtube") — Solo YouTube del 318
+        ver_flujos_dpi_detalle(aplicacion="torrent") — Buscar torrent en TODA la red
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo flujos DPI detallados...", file=sys.stderr)
+        from collections import defaultdict
+
+        session = get_vmanage_session()
+
+        def fmt_bytes(b):
+            try: b = int(b)
+            except: return str(b)
+            if b > 1024**3: return f"{b / (1024**3):.2f} GB"
+            if b > 1024**2: return f"{b / (1024**2):.1f} MB"
+            if b > 1024: return f"{b / 1024:.1f} KB"
+            return f"{b} B"
+
+        # Resolver system_ips si se especifica sitio
+        system_ips = []
+        hostnames_map = {}
+        site_label = "TODA LA RED"
+
+        if sitio:
+            devices_result = session.get("/dataservice/device")
+            sitio_lower = sitio.strip().lower()
+
+            for dev in devices_result.get('data', []):
+                if dev.get('device-type') != 'vedge' or dev.get('reachability') != 'reachable':
+                    continue
+                dev_site_id = str(dev.get('site-id', ''))
+                dev_hostname = dev.get('host-name', '').lower()
+                sip = dev.get('system-ip', '')
+
+                if (sitio_lower == dev_site_id.lower() or
+                    sitio_lower in dev_site_id or
+                    sitio_lower in dev_hostname):
+                    system_ips.append(sip)
+                    hostnames_map[sip] = dev.get('host-name', sip)
+
+            if not system_ips:
+                return (f"❌ No se encontraron dispositivos para el sitio '{sitio}'\n\n"
+                        f"Usa: ver_flujos_dpi_detalle(sitio='51318') o ver_flujos_dpi_detalle(sitio='318')")
+
+            site_ids = sorted(set(str(dev.get('site-id', ''))
+                                  for dev in devices_result.get('data', [])
+                                  if dev.get('system-ip', '') in system_ips))
+            site_label = f"SITIO {', '.join(site_ids)}"
+
+        # Construir query
+        rules = []
+        if system_ips:
+            rules.append({"field": "vdevice_name", "type": "string", "value": system_ips, "operator": "in"})
+        if aplicacion:
+            rules.append({"field": "application", "type": "string", "value": [aplicacion.strip()], "operator": "in"})
+
+        payload = {
+            "query": {"condition": "AND", "rules": rules} if rules else {},
+            "size": min(top * 3, 500)  # Pedimos más para tener margen después del filtrado
+        }
+
+        resp = session.post("/dataservice/statistics/dpi", payload, timeout=60)
+        flows = resp.get('data', [])
+
+        if not flows:
+            msg = f"❌ No se encontraron flujos DPI"
+            if sitio:
+                msg += f" para el sitio '{sitio}'"
+            if aplicacion:
+                msg += f" con aplicación '{aplicacion}'"
+            msg += "\n\nSugerencias:\n"
+            msg += "  • Verifica que el sitio tenga DPI habilitado: diagnosticar_dpi_dispositivo('318')\n"
+            msg += "  • Usa ver_aplicaciones_sitio('318') para ver qué apps están clasificadas\n"
+            return msg
+
+        # Filtro adicional por aplicación (case-insensitive)
+        if aplicacion:
+            app_lower = aplicacion.strip().lower()
+            flows_filtered = [f for f in flows if app_lower in f.get('application', '').lower()]
+            if flows_filtered:
+                flows = flows_filtered
+
+        proto_map = {'6': 'TCP', '17': 'UDP', '1': 'ICMP', '47': 'GRE', '50': 'ESP', '132': 'SCTP'}
+
+        # ── Construir resultado ──
+        resultado = f"🔬 FLUJOS DPI DETALLADOS — {site_label}\n"
+        resultado += f"{'='*140}\n\n"
+        if sitio:
+            resultado += f"📡 Dispositivos: {', '.join(hostnames_map.values()) if hostnames_map else 'N/A'}\n"
+        if aplicacion:
+            resultado += f"🔍 Filtro aplicación: '{aplicacion}'\n"
+        resultado += f"📊 Flujos obtenidos: {len(flows)}\n\n"
+
+        # ── TABLA DE FLUJOS ──
+        resultado += f"{'#':<4} {'APLICACIÓN':<25} {'IP ORIGEN':<18} {'PTO':<7} {'IP DESTINO':<18} {'PTO':<7} {'PROTO':<6} {'BYTES':<12} {'INTERFAZ':<25}\n"
+        resultado += f"{'-'*125}\n"
+
+        # Acumuladores para el resumen
+        dst_ips = defaultdict(lambda: {'bytes': 0, 'flows': 0, 'apps': set()})
+        src_ips = defaultdict(lambda: {'bytes': 0, 'flows': 0})
+        dst_ports = defaultdict(lambda: {'bytes': 0, 'flows': 0, 'proto': ''})
+        apps_count = defaultdict(lambda: {'bytes': 0, 'flows': 0})
+        total_bytes = 0
+
+        for i, f in enumerate(flows[:top], 1):
+            app = f.get('application', '?')
+            src_ip = f.get('source_ip', '?')
+            dst_ip = f.get('dest_ip', '?')
+            src_port = str(f.get('source_port', '?'))
+            dst_port = str(f.get('dest_port', '?'))
+            proto = proto_map.get(str(f.get('ip_proto', '')), str(f.get('ip_proto', '?')))
+            octets = int(f.get('octets', 0))
+            iface = f.get('ingress_intf', f.get('egress_intf', '?'))
+
+            resultado += f"{i:<4} {app:<25} {src_ip:<18} {src_port:<7} {dst_ip:<18} {dst_port:<7} {proto:<6} {fmt_bytes(octets):<12} {iface}\n"
+
+            # Acumular
+            total_bytes += octets
+            dst_ips[dst_ip]['bytes'] += octets
+            dst_ips[dst_ip]['flows'] += 1
+            dst_ips[dst_ip]['apps'].add(app)
+            src_ips[src_ip]['bytes'] += octets
+            src_ips[src_ip]['flows'] += 1
+            dst_ports[dst_port]['bytes'] += octets
+            dst_ports[dst_port]['flows'] += 1
+            dst_ports[dst_port]['proto'] = proto
+            apps_count[app]['bytes'] += octets
+            apps_count[app]['flows'] += 1
+
+        if len(flows) > top:
+            resultado += f"\n   ... mostrando {top} de {len(flows)} flujos disponibles\n"
+
+        # ── RESUMEN: TOP IPs DESTINO ──
+        resultado += f"\n{'='*140}\n"
+        resultado += f"🎯 TOP 15 IPs DESTINO:\n\n"
+        resultado += f"{'#':<4} {'IP DESTINO':<18} {'TRÁFICO':<14} {'FLUJOS':<8} {'APLICACIONES'}\n"
+        resultado += f"{'-'*80}\n"
+
+        for i, (ip, data) in enumerate(sorted(dst_ips.items(), key=lambda x: x[1]['bytes'], reverse=True)[:15], 1):
+            apps_str = ', '.join(sorted(data['apps']))[:45]
+            resultado += f"{i:<4} {ip:<18} {fmt_bytes(data['bytes']):<14} {data['flows']:<8} {apps_str}\n"
+
+        # ── RESUMEN: TOP IPs ORIGEN ──
+        resultado += f"\n{'='*140}\n"
+        resultado += f"📤 TOP 15 IPs ORIGEN (hosts internos):\n\n"
+        resultado += f"{'#':<4} {'IP ORIGEN':<18} {'TRÁFICO':<14} {'FLUJOS':<8}\n"
+        resultado += f"{'-'*45}\n"
+
+        for i, (ip, data) in enumerate(sorted(src_ips.items(), key=lambda x: x[1]['bytes'], reverse=True)[:15], 1):
+            resultado += f"{i:<4} {ip:<18} {fmt_bytes(data['bytes']):<14} {data['flows']:<8}\n"
+
+        # ── RESUMEN: TOP PUERTOS ──
+        resultado += f"\n{'='*140}\n"
+        resultado += f"🔌 TOP 10 PUERTOS DESTINO:\n\n"
+
+        well_known = {'443': 'HTTPS', '80': 'HTTP', '53': 'DNS', '22': 'SSH', '25': 'SMTP',
+                      '110': 'POP3', '143': 'IMAP', '993': 'IMAPS', '995': 'POP3S',
+                      '389': 'LDAP', '636': 'LDAPS', '3389': 'RDP', '5060': 'SIP',
+                      '5061': 'SIPS', '8080': 'HTTP-Alt', '8443': 'HTTPS-Alt',
+                      '445': 'SMB', '139': 'NetBIOS', '1433': 'MSSQL', '3306': 'MySQL',
+                      '5432': 'PostgreSQL', '6379': 'Redis', '27017': 'MongoDB',
+                      '7680': 'WUDO', '1723': 'PPTP', '500': 'IKE', '4500': 'IPsec-NAT'}
+
+        resultado += f"{'#':<4} {'PUERTO':<8} {'SERVICIO':<14} {'PROTO':<6} {'TRÁFICO':<14} {'FLUJOS':<8}\n"
+        resultado += f"{'-'*58}\n"
+
+        for i, (port, data) in enumerate(sorted(dst_ports.items(), key=lambda x: x[1]['bytes'], reverse=True)[:10], 1):
+            svc = well_known.get(str(port), '')
+            resultado += f"{i:<4} {port:<8} {svc:<14} {data['proto']:<6} {fmt_bytes(data['bytes']):<14} {data['flows']:<8}\n"
+
+        # ── RESUMEN: APPS EN ESTOS FLUJOS ──
+        if not aplicacion and len(apps_count) > 1:
+            resultado += f"\n{'='*140}\n"
+            resultado += f"📱 APLICACIONES EN ESTOS FLUJOS:\n\n"
+            for i, (app, data) in enumerate(sorted(apps_count.items(), key=lambda x: x[1]['bytes'], reverse=True)[:20], 1):
+                pct = (data['bytes'] / total_bytes * 100) if total_bytes > 0 else 0
+                resultado += f"   {i:>2}. {app:<30} {fmt_bytes(data['bytes']):<14} {pct:>5.1f}%  ({data['flows']} flujos)\n"
+
+        resultado += f"\n{'='*140}\n"
+        resultado += f"💡 HERRAMIENTAS RELACIONADAS:\n"
+        resultado += f"  • ver_aplicaciones_sitio('{sitio or '318'}') — Ranking DPI agregado del sitio\n"
+        resultado += f"  • ver_dpi_red_completa() — Ranking global de apps de toda la red\n"
+        resultado += f"  • ver_top_consumidores_dpi(aplicacion='youtube') — Quién más consume una app\n"
+        resultado += f"  • ver_dpi_red_completa(familia='audio-video') — Filtrar por familia\n"
+
+        return resultado
+
+    except Exception as e:
+        return f"❌ Error al obtener flujos DPI: {str(e)}"
+
+
+# =====================================================
+# HERRAMIENTA 36: TOP CONSUMIDORES DPI (por app o global)
+# =====================================================
+@mcp.tool()
+def ver_top_consumidores_dpi(
+    aplicacion: str = "",
+    top: int = 30,
+    horas: int = 24
+) -> str:
+    """
+    Identifica los sitios/dispositivos que más consumen una aplicación específica en toda la red,
+    o los mayores consumidores globales. Ideal para detectar quién gasta más YouTube, torrent, etc.
+
+    Args:
+        aplicacion: Aplicación a analizar (ej: "youtube", "ssl", "torrent", "ms-teams").
+                   Si se deja vacío, muestra el top de consumidores por tráfico total.
+        top: Número de sitios/dispositivos a mostrar (default: 30)
+        horas: Ventana de tiempo en horas (default: 24, máx 720)
+
+    Returns:
+        Ranking de sitios que más consumen la aplicación, con tráfico total, porcentaje
+        y número de dispositivos. Si se especifica app, incluye detalle por dispositivo.
+
+    Ejemplo:
+        ver_top_consumidores_dpi(aplicacion="youtube") — Quién consume más YouTube
+        ver_top_consumidores_dpi(aplicacion="torrent") — Detectar P2P
+        ver_top_consumidores_dpi() — Top consumidores globales de la red
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Buscando top consumidores DPI...", file=sys.stderr)
+        from collections import defaultdict
+
+        session = get_vmanage_session()
+
+        def fmt_bytes(b):
+            try: b = int(b)
+            except: return str(b)
+            if b > 1024**4: return f"{b / (1024**4):.2f} TB"
+            if b > 1024**3: return f"{b / (1024**3):.2f} GB"
+            if b > 1024**2: return f"{b / (1024**2):.1f} MB"
+            if b > 1024: return f"{b / 1024:.1f} KB"
+            return f"{b} B"
+
+        horas = max(1, min(horas, 720))
+
+        # Mapear system_ip → hostname + site_id
+        devices_result = session.get("/dataservice/device")
+        dev_map = {}
+        for dev in devices_result.get('data', []):
+            sip = dev.get('system-ip', '')
+            dev_map[sip] = {
+                'hostname': dev.get('host-name', sip),
+                'site_id': str(dev.get('site-id', 'N/A'))
+            }
+
+        # ── Query: tráfico por dispositivo + aplicación ──
+        time_rules = []
+        if horas != 24:
+            time_rules.append({"field": "entry_time", "type": "date", "value": [str(horas)], "operator": "last_n_hours"})
+
+        if aplicacion:
+            app_name = aplicacion.strip()
+
+            # Tráfico de la app por dispositivo
+            payload_dev = {
+                "query": {"condition": "AND", "rules": [
+                    {"field": "application", "type": "string", "value": [app_name], "operator": "in"}
+                ] + time_rules},
+                "aggregation": {
+                    "field": [{"property": "vdevice_name", "size": 400, "sequence": 1}],
+                    "metrics": [
+                        {"property": "octets", "type": "sum"},
+                        {"property": "packets", "type": "sum"}
+                    ]
+                }
+            }
+
+            resp_dev = session.post("/dataservice/statistics/dpi/aggregation", payload_dev, timeout=60)
+            dev_data = resp_dev.get('data', [])
+
+            if not dev_data:
+                # Búsqueda flexible: intentar con match parcial
+                payload_all_apps = {
+                    "query": {"condition": "AND", "rules": time_rules},
+                    "aggregation": {
+                        "field": [{"property": "application", "size": 500}],
+                        "metrics": [{"property": "octets", "type": "sum"}]
+                    }
+                }
+                resp_all = session.post("/dataservice/statistics/dpi/aggregation", payload_all_apps, timeout=60)
+                all_apps = [a.get('application', '') for a in resp_all.get('data', [])]
+                app_lower = app_name.lower()
+                similares = [a for a in all_apps if app_lower in a.lower() or any(p in a.lower() for p in app_lower.split('-'))]
+
+                resultado = f"❌ No se encontraron datos para la aplicación '{app_name}'\n\n"
+                if similares:
+                    resultado += f"📋 Aplicaciones similares ({len(similares)}):\n"
+                    for a in sorted(similares)[:20]:
+                        resultado += f"   • {a}\n"
+                    resultado += f"\n💡 Intenta: ver_top_consumidores_dpi(aplicacion='{similares[0]}')\n"
+                else:
+                    resultado += f"📋 Primeras 30 aplicaciones disponibles:\n"
+                    for a in sorted(all_apps)[:30]:
+                        resultado += f"   • {a}\n"
+                return resultado
+
+            # También obtener tráfico total de la app
+            payload_total = {
+                "query": {"condition": "AND", "rules": [
+                    {"field": "application", "type": "string", "value": [app_name], "operator": "in"}
+                ] + time_rules},
+                "aggregation": {
+                    "field": [],
+                    "metrics": [
+                        {"property": "octets", "type": "sum"},
+                        {"property": "packets", "type": "sum"}
+                    ]
+                }
+            }
+            try:
+                resp_total = session.post("/dataservice/statistics/dpi/aggregation", payload_total, timeout=30)
+                total_app_bytes = int(resp_total.get('data', [{}])[0].get('octets', 0))
+            except:
+                total_app_bytes = sum(int(d.get('octets', 0)) for d in dev_data)
+
+            # Agrupar por sitio
+            site_agg = defaultdict(lambda: {'bytes': 0, 'packets': 0, 'devices': []})
+            for d in dev_data:
+                sip = d.get('vdevice_name', '')
+                info = dev_map.get(sip, {'hostname': sip, 'site_id': 'N/A'})
+                sid = info['site_id']
+                site_agg[sid]['bytes'] += int(d.get('octets', 0))
+                site_agg[sid]['packets'] += int(d.get('packets', 0))
+                site_agg[sid]['devices'].append({
+                    'hostname': info['hostname'],
+                    'bytes': int(d.get('octets', 0)),
+                    'packets': int(d.get('packets', 0))
+                })
+
+            sites_ranked = sorted(site_agg.items(), key=lambda x: x[1]['bytes'], reverse=True)
+
+            resultado = f"🎯 TOP CONSUMIDORES DE: {app_name.upper()}\n"
+            resultado += f"{'='*120}\n\n"
+            resultado += f"⏰ Ventana: últimas {horas} hora(s)\n"
+            resultado += f"📊 Tráfico total de {app_name}: {fmt_bytes(total_app_bytes)}\n"
+            resultado += f"🏢 Sitios con tráfico: {len(sites_ranked)}\n"
+            resultado += f"📡 Dispositivos con tráfico: {len(dev_data)}\n\n"
+
+            resultado += f"{'#':<5} {'SITE ID':<12} {'TRÁFICO':<14} {'% DEL TOTAL':<14} {'DISPOSITIVOS'}\n"
+            resultado += f"{'-'*100}\n"
+
+            for i, (sid, data) in enumerate(sites_ranked[:top], 1):
+                pct = (data['bytes'] / total_app_bytes * 100) if total_app_bytes > 0 else 0
+                devs = sorted(data['devices'], key=lambda x: x['bytes'], reverse=True)
+                devs_str = ', '.join(f"{d['hostname']}({fmt_bytes(d['bytes'])})" for d in devs)[:55]
+
+                if pct >= 10: icon = "🔴"
+                elif pct >= 5: icon = "🟠"
+                elif pct >= 1: icon = "🟡"
+                else: icon = "🟢"
+
+                resultado += f"{i:<5} {icon} {sid:<10} {fmt_bytes(data['bytes']):<14} {pct:>5.1f}%        {devs_str}\n"
+
+            # Concentración
+            if sites_ranked:
+                top3_bytes = sum(s[1]['bytes'] for s in sites_ranked[:3])
+                top10_bytes = sum(s[1]['bytes'] for s in sites_ranked[:10])
+                top3_pct = (top3_bytes / total_app_bytes * 100) if total_app_bytes > 0 else 0
+                top10_pct = (top10_bytes / total_app_bytes * 100) if total_app_bytes > 0 else 0
+
+                resultado += f"\n{'='*120}\n"
+                resultado += f"📈 CONCENTRACIÓN:\n\n"
+                resultado += f"   Top 3 sitios:  {fmt_bytes(top3_bytes)} ({top3_pct:.1f}% del total)\n"
+                resultado += f"   Top 10 sitios: {fmt_bytes(top10_bytes)} ({top10_pct:.1f}% del total)\n"
+                resultado += f"   Todos ({len(sites_ranked)}):  {fmt_bytes(total_app_bytes)} (100%)\n"
+
+                if top3_pct > 60:
+                    resultado += f"\n   ⚠️  Alta concentración — El {top3_pct:.0f}% del tráfico de {app_name} viene de solo 3 sitios\n"
+
+        else:
+            # Sin filtro de app: top sitios por tráfico DPI total
+            payload_sites = {
+                "query": {"condition": "AND", "rules": time_rules},
+                "aggregation": {
+                    "field": [{"property": "vdevice_name", "size": 400, "sequence": 1}],
+                    "metrics": [
+                        {"property": "octets", "type": "sum"},
+                        {"property": "packets", "type": "sum"}
+                    ]
+                }
+            }
+
+            resp_sites = session.post("/dataservice/statistics/dpi/aggregation", payload_sites, timeout=60)
+            sites_data = resp_sites.get('data', [])
+
+            if not sites_data:
+                return "❌ No hay datos DPI de agregación en la red."
+
+            # Agrupar por sitio
+            site_agg = defaultdict(lambda: {'bytes': 0, 'packets': 0, 'devices': []})
+            for sd in sites_data:
+                sip = sd.get('vdevice_name', '')
+                info = dev_map.get(sip, {'hostname': sip, 'site_id': 'N/A'})
+                sid = info['site_id']
+                site_agg[sid]['bytes'] += int(sd.get('octets', 0))
+                site_agg[sid]['packets'] += int(sd.get('packets', 0))
+                site_agg[sid]['devices'].append(info['hostname'])
+
+            sites_ranked = sorted(site_agg.items(), key=lambda x: x[1]['bytes'], reverse=True)
+            total_bytes = sum(s[1]['bytes'] for s in sites_ranked)
+
+            resultado = f"🏆 TOP CONSUMIDORES DE LA RED (TRÁFICO DPI TOTAL)\n"
+            resultado += f"{'='*120}\n\n"
+            resultado += f"⏰ Ventana: últimas {horas} hora(s)\n"
+            resultado += f"📊 Tráfico total clasificado: {fmt_bytes(total_bytes)}\n"
+            resultado += f"🏢 Sitios con tráfico: {len(sites_ranked)}\n\n"
+
+            resultado += f"{'#':<5} {'SITE ID':<12} {'TRÁFICO':<14} {'% RED':<10} {'PAQUETES':<16} {'DISPOSITIVOS'}\n"
+            resultado += f"{'-'*105}\n"
+
+            for i, (sid, data) in enumerate(sites_ranked[:top], 1):
+                pct = (data['bytes'] / total_bytes * 100) if total_bytes > 0 else 0
+                devs = ', '.join(sorted(set(data['devices'])))[:50]
+
+                if pct >= 5: icon = "🔴"
+                elif pct >= 2: icon = "🟠"
+                elif pct >= 0.5: icon = "🟡"
+                else: icon = "🟢"
+
+                resultado += f"{i:<5} {icon} {sid:<10} {fmt_bytes(data['bytes']):<14} {pct:>5.1f}%     {data['packets']:<16,} {devs}\n"
+
+            # Top apps globales rápido
+            payload_top_apps = {
+                "query": {"condition": "AND", "rules": time_rules},
+                "aggregation": {
+                    "field": [{"property": "application", "size": 10}],
+                    "metrics": [{"property": "octets", "type": "sum"}]
+                }
+            }
+            resp_ta = session.post("/dataservice/statistics/dpi/aggregation", payload_top_apps, timeout=30)
+            top_apps = sorted(resp_ta.get('data', []), key=lambda x: int(x.get('octets', 0)), reverse=True)
+
+            if top_apps:
+                resultado += f"\n{'='*120}\n"
+                resultado += f"📱 TOP 10 APLICACIONES GLOBALES:\n\n"
+                for i, app in enumerate(top_apps[:10], 1):
+                    pct = (int(app.get('octets', 0)) / total_bytes * 100) if total_bytes > 0 else 0
+                    resultado += f"   {i:>2}. {app.get('application','?'):<30} {fmt_bytes(app.get('octets',0)):<14} ({pct:.1f}%)\n"
+
+        resultado += f"\n{'='*120}\n"
+        resultado += f"💡 HERRAMIENTAS RELACIONADAS:\n"
+        resultado += f"  • ver_dpi_red_completa() — Ranking global de todas las apps\n"
+        resultado += f"  • ver_flujos_dpi_detalle(sitio='318', aplicacion='youtube') — Flujos detallados\n"
+        resultado += f"  • ver_aplicaciones_sitio('318') — DPI detallado de un sitio\n"
+        resultado += f"  • ver_top_consumidores_dpi(aplicacion='ms-teams', horas=168) — Última semana\n"
+
+        return resultado
+
+    except Exception as e:
+        return f"❌ Error al buscar consumidores DPI: {str(e)}"
+
+
 if __name__ == "__main__":
     """
     Punto de entrada principal del servidor MCP.
