@@ -2,16 +2,23 @@
 """
 Servidor MCP para gestión de Cisco SD-WAN (vManage)
 Desarrollado con FastMCP para Network Automation
+
+AUTENTICACIÓN:
+- vManage: API REST con usuario/contraseña
 """
 
 import os
+import sys
 import requests
 import urllib3
-from typing import Dict, Any, Optional
+import base64
+import threading
+import time
+import re
+from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from browser_cookies import BrowserCookieExtractor
 
 # Desactivar advertencias de SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -23,151 +30,98 @@ load_dotenv()
 mcp = FastMCP("cisco-sdwan-manager")
 
 
-class AnalyticsCloudSession:
-    """Clase para gestionar la sesión con Cisco Analytics Cloud"""
-    
-    def __init__(self):
-        self.base_url = "https://us02.analytics.sdwan.cisco.com"
-        self.session = requests.Session()
-        self.session.verify = False
-        
-        # Intentar cargar cookies desde archivo primero (más confiable desde Claude Desktop)
-        csrf_token = None
-        overlay_id = None
-        session_cookie = None
-        
-        cookies_file = os.path.join(os.path.dirname(__file__), '.analytics_cookies.json')
-        
-        if os.path.exists(cookies_file):
-            try:
-                import json
-                with open(cookies_file, 'r') as f:
-                    cookies_data = json.load(f)
-                
-                session_cookie = cookies_data.get('session')
-                csrf_token = cookies_data.get('csrf_token')
-                overlay_id = cookies_data.get('overlay_id')
-                
-                if session_cookie:
-                    self.session.cookies.set('session', session_cookie, 
-                                            domain='.analytics.sdwan.cisco.com', 
-                                            path='/')
-                if csrf_token:
-                    self.session.cookies.set('okta-oauth-state', csrf_token,
-                                            domain='.analytics.sdwan.cisco.com',
-                                            path='/')
-                if overlay_id:
-                    self.session.cookies.set('cl-overlay-id', overlay_id,
-                                            domain='.analytics.sdwan.cisco.com',
-                                            path='/')
-                    
-            except Exception as e:
-                print(f"Warning: No se pudo leer cookies desde archivo: {e}")
-        
-        # Si no hay cookies del archivo, intentar extraerlas del navegador
-        if not session_cookie or not csrf_token:
-            try:
-                import browser_cookie3
-                cj = browser_cookie3.chrome(domain_name='us02.analytics.sdwan.cisco.com')
-                
-                for cookie in cj:
-                    if 'cisco.com' in cookie.domain:
-                        self.session.cookies.set(cookie.name, cookie.value, 
-                                                domain=cookie.domain, path=cookie.path)
-                        
-                    if cookie.name == 'okta-oauth-state':
-                        csrf_token = cookie.value
-                    elif cookie.name == 'cl-overlay-id':
-                        overlay_id = cookie.value
-                        
-            except Exception as e:
-                print(f"Warning: No se pudo extraer cookies del navegador: {e}")
-        
-        # Headers necesarios
-        self.session.headers.update({
-            'Content-Type': 'application/json',
-            'Accept': 'application/json, text/plain, */*',
-            'x-csrftoken': csrf_token if csrf_token else '',
-            'sdwan-overlay': overlay_id if overlay_id else '',
-            'Origin': 'https://us02.analytics.sdwan.cisco.com',
-            'Referer': 'https://us02.analytics.sdwan.cisco.com/analytics/v4/overview',
-        })
-    
-    def post(self, endpoint: str, json_data: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
-        """Hacer petición POST a Analytics Cloud"""
-        url = f"{self.base_url}{endpoint}"
-        response = self.session.post(url, json=json_data, timeout=timeout)
-        response.raise_for_status()
-        return response.json()
-
-
-def get_analytics_session():
-    """Obtiene una sesión de Analytics Cloud"""
-    return AnalyticsCloudSession()
-
-
 class VManageSession:
-    """Clase para gestionar la sesión con vManage usando cookies del navegador"""
+    """Clase para gestionar la sesión con vManage usando API PURA
     
-    def __init__(self, ip: str, username: str = None, password: str = None):
+    Autenticación programática con usuario/contraseña (NO requiere cookies previas)
+    Este es el método correcto para automatización y scripts.
+    """
+    
+    def __init__(self, ip: str, username: str, password: str):
         self.base_url = f"https://{ip}"
         self.username = username
         self.password = password
         self.session = requests.Session()
         self.session.verify = False
         self.token = None
-        self.cookie_extractor = BrowserCookieExtractor(ip)
         
     def login(self) -> bool:
         """
-        Obtiene cookies del navegador automáticamente.
-        Ya no intenta autenticación programática que falla en vManage.
+        Autenticación PROGRAMÁTICA con vManage (API Pura).
+        
+        NO requiere cookies del navegador.
+        Hace POST a /j_security_check con usuario/contraseña.
         
         Returns:
-            bool: True si se obtuvieron cookies válidas, False en caso contrario
+            bool: True si login exitoso, False en caso contrario
         """
         try:
-            # Extraer cookies del navegador
-            jsessionid, xsrf_token = self.cookie_extractor.get_cookies()
+            from datetime import datetime
+            print(f"\n🔐 [{datetime.now().strftime('%H:%M:%S')}] Autenticando con vManage (API Pura)...")
             
-            if not jsessionid or not xsrf_token:
-                print("\n❌ No se encontraron cookies válidas en el navegador")
-                print("📋 Inicia sesión en vManage desde tu navegador primero")
+            # 1. POST con credenciales (API Pura - sin cookies previas)
+            login_url = f"{self.base_url}/j_security_check"
+            login_data = {
+                'j_username': self.username,
+                'j_password': self.password
+            }
+            
+            login_response = self.session.post(
+                login_url,
+                data=login_data,
+                verify=False,
+                timeout=30
+            )
+            
+            # Verificar que recibimos cookies de sesión
+            if 'JSESSIONID' not in self.session.cookies:
+                print(f"❌ Login falló - No se recibió JSESSIONID")
+                print(f"   Status: {login_response.status_code}")
                 return False
             
-            # Configurar sesión con las cookies extraídas
-            self.session.cookies.set("JSESSIONID", jsessionid)
-            self.token = xsrf_token
+            jsessionid = self.session.cookies.get('JSESSIONID')
+            print(f"✓ JSESSIONID obtenido: {jsessionid[:30]}...")
             
-            # Configurar headers necesarios
+            # 2. Obtener token XSRF
+            token_url = f"{self.base_url}/dataservice/client/token"
+            token_response = self.session.get(
+                token_url,
+                verify=False,
+                timeout=10
+            )
+            
+            if token_response.status_code != 200:
+                print(f"❌ No se pudo obtener XSRF token")
+                return False
+            
+            self.token = token_response.text
+            print(f"✓ XSRF-Token obtenido: {self.token[:30]}...")
+            
+            # 3. Configurar headers para futuras peticiones
             self.session.headers.update({
                 "X-XSRF-TOKEN": self.token,
                 "Content-Type": "application/json"
             })
             
-            # Verificar que las cookies funcionan
+            # 4. Verificar que la API funciona
             test_url = f"{self.base_url}/dataservice/device"
-            test_response = self.session.get(
-                test_url,
-                verify=False,
-                timeout=10
-            )
+            test_response = self.session.get(test_url, timeout=10)
             
             if test_response.status_code == 200:
+                print(f"✅ Autenticación exitosa (API Pura)")
                 return True
             else:
-                print(f"⚠️  Cookies extraídas pero no válidas (HTTP {test_response.status_code})")
-                # Intentar refrescar cookies
-                jsessionid, xsrf_token = self.cookie_extractor.get_cookies(force_refresh=True)
-                if jsessionid and xsrf_token:
-                    self.session.cookies.set("JSESSIONID", jsessionid)
-                    self.token = xsrf_token
-                    self.session.headers.update({"X-XSRF-TOKEN": self.token})
-                    return True
+                print(f"❌ API no responde correctamente: {test_response.status_code}")
                 return False
                 
+        except requests.exceptions.Timeout:
+            print(f"❌ Timeout al conectar con vManage")
+            return False
+        except requests.exceptions.ConnectionError:
+            print(f"❌ Error de conexión - Verifica que vManage esté accesible")
+            return False
         except Exception as e:
-            print(f"❌ Error al obtener cookies: {str(e)}")
+            print(f"❌ Error durante login: {str(e)}")
             return False
     
     def get(self, endpoint: str, timeout: int = 30) -> Dict[str, Any]:
@@ -183,12 +137,21 @@ class VManageSession:
         """
         try:
             url = f"{self.base_url}{endpoint}"
+            # Log de la consulta
+            print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] GET {endpoint[:100]}", file=sys.stderr)
             response = self.session.get(url, timeout=timeout)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            # Log del resultado
+            if isinstance(result, dict) and 'data' in result:
+                data_count = len(result['data']) if isinstance(result['data'], list) else 1
+                print(f"   ✓ Respuesta: {data_count} registro(s)", file=sys.stderr)
+            return result
         except requests.exceptions.Timeout:
+            print(f"   ⏱️  Timeout", file=sys.stderr)
             raise TimeoutError(f"Timeout al consultar {endpoint}")
         except requests.exceptions.RequestException as e:
+            print(f"   ❌ Error: {str(e)[:80]}", file=sys.stderr)
             raise ConnectionError(f"Error en petición GET a {endpoint}: {str(e)}")
     
     def post(self, endpoint: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
@@ -205,24 +168,34 @@ class VManageSession:
         """
         try:
             url = f"{self.base_url}{endpoint}"
+            # Log de la consulta
+            print(f"📤 [{datetime.now().strftime('%H:%M:%S')}] POST {endpoint[:100]}", file=sys.stderr)
             response = self.session.post(url, json=payload, timeout=timeout)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            # Log del resultado
+            print(f"   ✓ Respuesta recibida", file=sys.stderr)
+            return result
         except requests.exceptions.Timeout:
+            print(f"   ⏱️  Timeout", file=sys.stderr)
             raise TimeoutError(f"Timeout al consultar {endpoint}")
         except requests.exceptions.RequestException as e:
+            print(f"   ❌ Error: {str(e)[:80]}", file=sys.stderr)
             raise ConnectionError(f"Error en petición POST a {endpoint}: {str(e)}")
 
 
 def get_vmanage_session() -> VManageSession:
     """
-    Crea y autentica una sesión con vManage usando credenciales del .env
+    Crea y autentica una sesión con vManage usando API PURA.
+    
+    Autenticación programática con usuario/contraseña del .env.
+    NO requiere cookies del navegador ni variables JSESSIONID/XSRF_TOKEN en .env.
     
     Returns:
-        VManageSession autenticada
+        VManageSession autenticada con API pura
         
     Raises:
-        ValueError: Si faltan variables de entorno
+        ValueError: Si faltan credenciales (IP, usuario, contraseña)
         ConnectionError: Si falla la autenticación
     """
     vmanage_ip = os.getenv('VMANAGE_IP')
@@ -231,14 +204,242 @@ def get_vmanage_session() -> VManageSession:
     
     if not all([vmanage_ip, username, password]):
         raise ValueError(
-            "Faltan credenciales en el archivo .env. "
-            "Se requieren: VMANAGE_IP, VMANAGE_USERNAME, VMANAGE_PASSWORD"
+            "❌ Faltan credenciales de vManage en el archivo .env\n\n"
+            "Se requieren:\n"
+            "  VMANAGE_IP=tu_vmanage_ip\n"
+            "  VMANAGE_USERNAME=tu_usuario\n"
+            "  VMANAGE_PASSWORD=tu_contraseña\n\n"
+            "NO necesitas VMANAGE_JSESSIONID ni VMANAGE_XSRF_TOKEN\n"
+            "(Se generan automáticamente con API pura)"
         )
     
+    # Crear sesión con API pura (genera sus propias cookies)
     session = VManageSession(vmanage_ip, username, password)
     
     if not session.login():
-        raise ConnectionError("Error de autenticación con vManage. Verifica las credenciales.")
+        raise ConnectionError(
+            "❌ Error de autenticación con vManage\n\n"
+            "Verifica:\n"
+            "  • Credenciales correctas en .env\n"
+            "  • vManage accesible en la red\n"
+            "  • Usuario tiene permisos adecuados"
+        )
+    
+    return session
+
+
+class CatalystCenterSession:
+    """Clase para gestionar la sesión con Cisco Catalyst Center con renovación automática de token"""
+    
+    def __init__(self, ip: str, username: str, password: str):
+        self.base_url = f"https://{ip}"
+        self.username = username
+        self.password = password
+        self.token = None
+        self.token_expiry = None
+        self.session = requests.Session()
+        self.session.verify = False
+        self._token_lock = threading.Lock()
+        self._auto_refresh = False
+        self._refresh_thread = None
+        
+    def obtener_token(self) -> str:
+        """
+        Obtiene un token de autenticación de Catalyst Center.
+        El token tiene validez de 60 minutos.
+        
+        Returns:
+            str: Token de autenticación
+            
+        Raises:
+            ConnectionError: Si falla la autenticación
+        """
+        with self._token_lock:
+            try:
+                # Codificar credenciales en Base64
+                credentials = f"{self.username}:{self.password}"
+                encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
+                
+                # Preparar headers para autenticación
+                headers = {
+                    'Authorization': f'Basic {encoded_credentials}',
+                    'Content-Type': 'application/json'
+                }
+                
+                # Realizar petición POST para obtener token
+                auth_url = f"{self.base_url}/dna/system/api/v1/auth/token"
+                response = self.session.post(
+                    auth_url,
+                    headers=headers,
+                    verify=False,
+                    timeout=30
+                )
+                
+                response.raise_for_status()
+                
+                # Extraer token de la respuesta
+                token_data = response.json()
+                self.token = token_data.get('Token')
+                
+                if not self.token:
+                    raise ConnectionError("No se recibió token en la respuesta")
+                
+                # Establecer tiempo de expiración (55 minutos para renovar antes)
+                self.token_expiry = datetime.now() + timedelta(minutes=55)
+                
+                # Configurar headers de sesión con el token
+                self.session.headers.update({
+                    'X-Auth-Token': self.token,
+                    'Content-Type': 'application/json'
+                })
+                
+                print(f"✓ Token obtenido exitosamente. Válido hasta: {self.token_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                return self.token
+                
+            except requests.exceptions.RequestException as e:
+                raise ConnectionError(f"Error al obtener token de Catalyst Center: {str(e)}")
+            except Exception as e:
+                raise ConnectionError(f"Error inesperado al obtener token: {str(e)}")
+    
+    def _verificar_y_renovar_token(self) -> None:
+        """
+        Verifica si el token está por expirar y lo renueva si es necesario.
+        Se llama automáticamente antes de cada petición.
+        """
+        if not self.token or not self.token_expiry:
+            self.obtener_token()
+        elif datetime.now() >= self.token_expiry:
+            print("⚠️  Token expirado, renovando...")
+            self.obtener_token()
+    
+    def _auto_refresh_loop(self) -> None:
+        """
+        Loop en segundo plano para renovar el token automáticamente cada 55 minutos.
+        """
+        while self._auto_refresh:
+            time.sleep(3300)  # 55 minutos
+            if self._auto_refresh:  # Verificar nuevamente antes de renovar
+                try:
+                    print("🔄 Renovación automática de token programada...")
+                    self.obtener_token()
+                except Exception as e:
+                    print(f"❌ Error en renovación automática: {e}")
+    
+    def iniciar_renovacion_automatica(self) -> None:
+        """
+        Inicia un hilo en segundo plano que renovará el token automáticamente cada 55 minutos.
+        Útil para scripts de larga duración.
+        """
+        if not self._auto_refresh:
+            self._auto_refresh = True
+            self._refresh_thread = threading.Thread(target=self._auto_refresh_loop, daemon=True)
+            self._refresh_thread.start()
+            print("✓ Renovación automática de token iniciada")
+    
+    def detener_renovacion_automatica(self) -> None:
+        """
+        Detiene la renovación automática del token.
+        """
+        if self._auto_refresh:
+            self._auto_refresh = False
+            print("✓ Renovación automática de token detenida")
+    
+    def get(self, endpoint: str, timeout: int = 30) -> Dict[str, Any]:
+        """
+        Realiza una petición GET al API de Catalyst Center.
+        Renueva el token automáticamente si es necesario.
+        
+        Args:
+            endpoint: Endpoint del API (sin base_url)
+            timeout: Tiempo máximo de espera en segundos
+            
+        Returns:
+            Dict con la respuesta JSON del API
+        """
+        self._verificar_y_renovar_token()
+        
+        try:
+            url = f"{self.base_url}{endpoint}"
+            response = self.session.get(url, timeout=timeout)
+            
+            # Si recibimos 401, intentar renovar token y reintentar
+            if response.status_code == 401:
+                print("⚠️  Token inválido, renovando...")
+                self.obtener_token()
+                response = self.session.get(url, timeout=timeout)
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"Timeout al consultar {endpoint}")
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(f"Error en petición GET a {endpoint}: {str(e)}")
+    
+    def post(self, endpoint: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+        """
+        Realiza una petición POST al API de Catalyst Center.
+        Renueva el token automáticamente si es necesario.
+        
+        Args:
+            endpoint: Endpoint del API (sin base_url)
+            payload: Datos a enviar en el body
+            timeout: Tiempo máximo de espera en segundos
+            
+        Returns:
+            Dict con la respuesta JSON del API
+        """
+        self._verificar_y_renovar_token()
+        
+        try:
+            url = f"{self.base_url}{endpoint}"
+            response = self.session.post(url, json=payload, timeout=timeout)
+            
+            # Si recibimos 401, intentar renovar token y reintentar
+            if response.status_code == 401:
+                print("⚠️  Token inválido, renovando...")
+                self.obtener_token()
+                response = self.session.post(url, json=payload, timeout=timeout)
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"Timeout al consultar {endpoint}")
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(f"Error en petición POST a {endpoint}: {str(e)}")
+
+
+def get_catalyst_session(auto_refresh: bool = False) -> CatalystCenterSession:
+    """
+    Crea y autentica una sesión con Catalyst Center usando credenciales del .env.
+    
+    Args:
+        auto_refresh: Si es True, inicia renovación automática del token cada 55 minutos
+    
+    Returns:
+        CatalystCenterSession autenticada
+        
+    Raises:
+        ValueError: Si faltan variables de entorno
+        ConnectionError: Si falla la autenticación
+    """
+    catalyst_ip = os.getenv('CATALYST_IP')
+    username = os.getenv('CATALYST_USERNAME')
+    password = os.getenv('CATALYST_PASSWORD')
+    
+    if not all([catalyst_ip, username, password]):
+        raise ValueError(
+            "Faltan credenciales de Catalyst Center en el archivo .env. "
+            "Se requieren: CATALYST_IP, CATALYST_USERNAME, CATALYST_PASSWORD"
+        )
+    
+    session = CatalystCenterSession(catalyst_ip, username, password)
+    session.obtener_token()
+    
+    if auto_refresh:
+        session.iniciar_renovacion_automatica()
     
     return session
 
@@ -251,6 +452,7 @@ def listar_dispositivos() -> str:
     Returns:
         JSON string con el inventario completo de dispositivos
     """
+    print(f"\n🔧 [{datetime.now().strftime('%H:%M:%S')}] HERRAMIENTA INVOCADA: listar_dispositivos", file=sys.stderr)
     try:
         session = get_vmanage_session()
         endpoint = "/dataservice/device"
@@ -476,6 +678,241 @@ def ver_total_sesiones_bfd() -> str:
 
 
 @mcp.tool()
+def diagnosticar_dpi_dispositivo(identificador: str) -> str:
+    """
+    Diagnóstico completo de DPI para un dispositivo o sitio específico.
+    Verifica configuración, estado del servicio, aplicaciones detectadas y flujos DPI.
+    
+    Args:
+        identificador: Puede ser:
+                      - Site ID (ej: "318", "51318")
+                      - Hostname (ej: "SDWAN-CJF-318-RT01")
+                      - System IP (ej: "10.95.11.3")
+    
+    Returns:
+        Diagnóstico detallado de DPI incluyendo:
+        - Estado de dispositivos
+        - Configuración DPI
+        - Aplicaciones detectadas
+        - Flujos DPI activos
+        - Recomendaciones para solucionar problemas
+        
+    Ejemplo:
+        diagnosticar_dpi_dispositivo("318")
+        diagnosticar_dpi_dispositivo("SDWAN-CJF-318-RT01")
+    """
+    print(f"\n🔧 [{datetime.now().strftime('%H:%M:%S')}] HERRAMIENTA INVOCADA: diagnosticar_dpi_dispositivo", file=sys.stderr)
+    try:
+        session = get_vmanage_session()
+        
+        resultado = f"🔍 DIAGNÓSTICO DPI\n"
+        resultado += f"{'='*80}\n"
+        resultado += f"Criterio de búsqueda: {identificador}\n\n"
+        
+        # Buscar dispositivos que coincidan
+        devices_result = session.get("/dataservice/device")
+        
+        if 'data' not in devices_result:
+            return "❌ No se pudieron obtener los dispositivos"
+        
+        # Filtrar dispositivos
+        matched_devices = []
+        for dev in devices_result['data']:
+            site_id = str(dev.get('site-id', ''))
+            hostname = dev.get('host-name', '')
+            system_ip = dev.get('system-ip', '')
+            
+            if (identificador in site_id or
+                identificador.upper() in hostname.upper() or
+                identificador == system_ip):
+                matched_devices.append(dev)
+        
+        if not matched_devices:
+            return (
+                f"{resultado}\n"
+                f"❌ No se encontraron dispositivos con '{identificador}'\n\n"
+                f"Verifica:\n"
+                f"  • Site ID (ej: 318 o 51318)\n"
+                f"  • Hostname (ej: SDWAN-CJF-318-RT01)\n"
+                f"  • System IP (ej: 10.95.11.3)"
+            )
+        
+        resultado += f"✅ {len(matched_devices)} dispositivo(s) encontrado(s)\n\n"
+        resultado += f"{'='*80}\n\n"
+        
+        # Analizar cada dispositivo
+        for i, device in enumerate(matched_devices, 1):
+            hostname = device.get('host-name', 'N/A')
+            system_ip = device.get('system-ip', 'N/A')
+            device_id = device.get('deviceId', system_ip)
+            model = device.get('device-model', 'N/A')
+            site_id = device.get('site-id', 'N/A')
+            reachability = device.get('reachability', 'unknown')
+            state = device.get('state', 'N/A')
+            
+            status_icon = "🟢" if reachability == "reachable" else "🔴"
+            
+            resultado += f"{i}. {status_icon} {hostname}\n"
+            resultado += f"{'─'*80}\n"
+            resultado += f"   Site ID: {site_id}\n"
+            resultado += f"   System IP: {system_ip}\n"
+            resultado += f"   Modelo: {model}\n"
+            resultado += f"   Estado: {state} / {reachability}\n\n"
+            
+            if reachability != "reachable":
+                resultado += f"   ⚠️  Dispositivo no alcanzable - diagnóstico limitado\n\n"
+                continue
+            
+            # Verificar servicio DPI
+            resultado += f"   📊 SERVICIO DPI:\n"
+            try:
+                dpi_summary_endpoint = f"/dataservice/device/dpi/summary?deviceId={device_id}"
+                dpi_summary = session.get(dpi_summary_endpoint, timeout=10)
+                
+                if 'data' in dpi_summary and dpi_summary['data']:
+                    resultado += f"   ✅ Servicio DPI activo\n"
+                else:
+                    resultado += f"   ❌ Servicio DPI no devuelve datos\n"
+            except Exception as e:
+                resultado += f"   ❌ Servicio DPI no accesible\n"
+            
+            # Verificar aplicaciones detectadas
+            resultado += f"\n   📱 APLICACIONES DETECTADAS:\n"
+            try:
+                apps_endpoint = f"/dataservice/device/dpi/applications?deviceId={device_id}"
+                apps_result = session.get(apps_endpoint, timeout=10)
+                
+                if 'data' in apps_result:
+                    apps = apps_result['data']
+                    if apps:
+                        resultado += f"   ✅ {len(apps)} aplicaciones detectadas\n\n"
+                        
+                        # Top 10 aplicaciones
+                        apps_sorted = sorted(
+                            apps,
+                            key=lambda x: int(x.get('rx-bytes', 0)) + int(x.get('tx-bytes', 0)),
+                            reverse=True
+                        )[:10]
+                        
+                        resultado += f"   🔝 Top 10 aplicaciones por tráfico:\n"
+                        for j, app in enumerate(apps_sorted, 1):
+                            app_name = app.get('application', 'unknown')
+                            familia = app.get('family', 'N/A')
+                            rx_bytes = int(app.get('rx-bytes', 0))
+                            tx_bytes = int(app.get('tx-bytes', 0))
+                            total_bytes = rx_bytes + tx_bytes
+                            
+                            if total_bytes > 1024**3:  # GB
+                                size_str = f"{total_bytes / (1024**3):.2f} GB"
+                            elif total_bytes > 1024**2:  # MB
+                                size_str = f"{total_bytes / (1024**2):.2f} MB"
+                            else:
+                                size_str = f"{total_bytes / 1024:.2f} KB"
+                            
+                            resultado += f"      {j:2}. {app_name:25} ({familia:20}) - {size_str}\n"
+                    else:
+                        resultado += f"   ⚠️  DPI activo pero sin aplicaciones detectadas\n"
+                        resultado += f"\n   💡 Posibles causas:\n"
+                        resultado += f"      • No hay tráfico activo en este momento\n"
+                        resultado += f"      • El tráfico es todo encrypted/unknown\n"
+                        resultado += f"      • Esperar 5-10 minutos para acumular estadísticas\n"
+            except Exception as e:
+                resultado += f"   ❌ No se pueden consultar aplicaciones\n"
+            
+            resultado += f"\n"
+        
+        # Verificar flujos DPI globales para estos dispositivos
+        resultado += f"{'='*80}\n"
+        resultado += f"🌐 FLUJOS DPI EN ESTADÍSTICAS GLOBALES:\n\n"
+        
+        try:
+            # Limitar a 1000 flujos para performance
+            dpi_stats = session.get("/dataservice/statistics/dpi", timeout=30)
+            
+            if 'data' in dpi_stats:
+                all_flows = dpi_stats['data']
+                
+                # Filtrar flujos de los dispositivos encontrados
+                device_hostnames = [d.get('host-name', '') for d in matched_devices]
+                site_flows = [f for f in all_flows if f.get('host_name', '') in device_hostnames]
+                
+                if site_flows:
+                    resultado += f"✅ {len(site_flows)} flujos DPI encontrados\n\n"
+                    
+                    # Analizar aplicaciones en flujos
+                    apps_in_flows = {}
+                    for flow in site_flows:
+                        app = flow.get('application', 'unknown')
+                        octets = int(flow.get('octets', 0))
+                        if app not in apps_in_flows:
+                            apps_in_flows[app] = 0
+                        apps_in_flows[app] += octets
+                    
+                    resultado += f"📊 Top aplicaciones en flujos activos:\n"
+                    for app, octets in sorted(apps_in_flows.items(), key=lambda x: x[1], reverse=True)[:15]:
+                        if octets > 1024**2:
+                            size_str = f"{octets / (1024**2):.2f} MB"
+                        elif octets > 1024:
+                            size_str = f"{octets / 1024:.2f} KB"
+                        else:
+                            size_str = f"{octets} B"
+                        resultado += f"   • {app:30} - {size_str}\n"
+                else:
+                    resultado += f"⚠️  No hay flujos DPI activos en este momento\n\n"
+                    resultado += f"Esto significa que:\n"
+                    resultado += f"  1. No hay tráfico pasando por los dispositivos actualmente\n"
+                    resultado += f"  2. O el tráfico no está siendo inspeccionado por DPI\n"
+        except Exception as e:
+            resultado += f"⚠️  No se pudieron consultar flujos DPI globales\n"
+        
+        # Recomendaciones
+        resultado += f"\n{'='*80}\n"
+        resultado += f"💡 RECOMENDACIONES:\n\n"
+        
+        # Determinar qué recomendar basado en los resultados
+        tiene_servicio_dpi = False
+        tiene_aplicaciones = False
+        tiene_flujos = False
+        
+        try:
+            for device in matched_devices:
+                device_id = device.get('deviceId', device.get('system-ip', ''))
+                
+                # Check DPI service
+                dpi_summary = session.get(f"/dataservice/device/dpi/summary?deviceId={device_id}", timeout=5)
+                if 'data' in dpi_summary and dpi_summary['data']:
+                    tiene_servicio_dpi = True
+                
+                # Check applications
+                apps_result = session.get(f"/dataservice/device/dpi/applications?deviceId={device_id}", timeout=5)
+                if 'data' in apps_result and apps_result['data']:
+                    tiene_aplicaciones = True
+        except:
+            pass
+        
+        if not tiene_servicio_dpi:
+            resultado += f"❌ DPI no está habilitado:\n"
+            resultado += f"   1. Ve a vManage GUI → Configuration → Policies\n"
+            resultado += f"   2. Crea o edita una Centralized Policy\n"
+            resultado += f"   3. Habilita 'Application Aware Routing'\n"
+            resultado += f"   4. En Security Policy, habilita DPI/Firewall\n"
+            resultado += f"   5. Aplica la política al sitio\n\n"
+        elif not tiene_aplicaciones:
+            resultado += f"⚠️  DPI habilitado pero sin datos:\n"
+            resultado += f"   1. Genera tráfico de prueba (navega web, YouTube, etc.)\n"
+            resultado += f"   2. Espera 5-10 minutos para que se acumulen estadísticas\n"
+            resultado += f"   3. Verifica que el tráfico pase por estos routers\n"
+            resultado += f"   4. Usa 'ver_estadisticas_interfaces' para verificar tráfico\n\n"
+        else:
+            resultado += f"✅ DPI funcionando correctamente\n\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error en diagnóstico DPI: {str(e)}"
+
+
+@mcp.tool()
 def listar_alarmas_criticas() -> str:
     """
     Lista todas las alarmas de nivel crítico de las últimas 24 horas
@@ -541,55 +978,6 @@ def listar_alarmas_criticas() -> str:
 # ============================================================================
 # FASE 1: FUNCIONES ESENCIALES - MONITOREO Y CONECTIVIDAD
 # ============================================================================
-
-@mcp.tool()
-def ver_estadisticas_interfaces(device_id: str) -> str:
-    """
-    Consulta estadísticas detalladas de todas las interfaces de un dispositivo
-    
-    Args:
-        device_id: System IP del dispositivo (ejemplo: 10.80.10.207)
-    
-    Returns:
-        Estadísticas de tráfico, errores y estado de interfaces
-    """
-    try:
-        session = get_vmanage_session()
-        endpoint = f"/dataservice/device/interface/stats?deviceId={device_id}"
-        result = session.get(endpoint)
-        
-        if 'data' in result:
-            interfaces = result['data']
-            stats = []
-            
-            for iface in interfaces:
-                stats.append({
-                    'interface': iface.get('interface', 'N/A'),
-                    'vpn': iface.get('vpn-id', 'N/A'),
-                    'status': iface.get('if-oper-status', 'N/A'),
-                    'admin_status': iface.get('if-admin-status', 'N/A'),
-                    'ip_address': iface.get('ip-address', 'N/A'),
-                    'rx_kbps': iface.get('rx-kbps', 0),
-                    'tx_kbps': iface.get('tx-kbps', 0),
-                    'rx_packets': iface.get('rx-packets', 0),
-                    'tx_packets': iface.get('tx-packets', 0),
-                    'rx_errors': iface.get('rx-errors', 0),
-                    'tx_errors': iface.get('tx-errors', 0),
-                    'rx_drops': iface.get('rx-drops', 0),
-                    'tx_drops': iface.get('tx-drops', 0)
-                })
-            
-            return (
-                f"Estadísticas de interfaces del dispositivo {device_id}:\n\n"
-                f"Total de interfaces: {len(stats)}\n\n"
-                f"Detalle:\n{stats}"
-            )
-        
-        return f"No se encontraron estadísticas para el dispositivo {device_id}"
-        
-    except Exception as e:
-        return f"Error al obtener estadísticas de interfaces: {str(e)}"
-
 
 @mcp.tool()
 def ver_uso_cpu_memoria(device_id: str) -> str:
@@ -895,6 +1283,488 @@ def ver_aplicaciones_top(device_id: str, top: int = 10) -> str:
 
 
 @mcp.tool()
+def ver_aplicaciones_top_red_global(
+    top: int = 20,
+    limite_flujos: int = 1000
+) -> str:
+    """
+    Muestra las aplicaciones que más consumen ancho de banda en TODA LA RED SD-WAN.
+    Similar al dashboard "Top Applications" de vManage.
+    
+    Usa el endpoint /dataservice/statistics/dpi que proporciona estadísticas DPI 
+    agregadas de toda la red con información de IPs origen→destino.
+    
+    Args:
+        top: Número de aplicaciones a mostrar en el ranking (default: 20)
+        limite_flujos: Número máximo de flujos DPI a procesar (default: 1000)
+    
+    Returns:
+        Top aplicaciones de toda la red con estadísticas agregadas de uso
+        
+    Ejemplo:
+        ver_aplicaciones_top_red_global(top=15, limite_flujos=500)
+    """
+    print(f"\n🔧 [{datetime.now().strftime('%H:%M:%S')}] HERRAMIENTA INVOCADA: ver_aplicaciones_top_red_global", file=sys.stderr)
+    print(f"\n🔧 [{datetime.now().strftime('%H:%M:%S')}] HERRAMIENTA INVOCADA: ver_aplicaciones_top_red_global", file=sys.stderr)
+    try:
+        session = get_vmanage_session()
+        
+        # Usar el endpoint de estadísticas DPI agregadas
+        resultado_texto = f"📊 TOP {top} APPLICATIONS - TODA LA RED SD-WAN\n"
+        resultado_texto += f"{'='*80}\n\n"
+        resultado_texto += f"🔍 Consultando estadísticas DPI de toda la red...\n"
+        
+        # Endpoint de estadísticas DPI (proporciona datos agregados de todos los dispositivos)
+        endpoint = "/dataservice/statistics/dpi"
+        result = session.get(endpoint, timeout=60)
+        
+        if 'data' not in result:
+            return (
+                f"{resultado_texto}\n"
+                f"❌ El endpoint no devolvió datos\n"
+                f"Verifica que DPI esté habilitado en los dispositivos"
+            )
+        
+        dpi_flows = result['data']
+        
+        if not dpi_flows:
+            return (
+                f"{resultado_texto}\n"
+                f"ℹ️  No hay flujos DPI disponibles en este momento\n\n"
+                f"Verifica:\n"
+                f"  • DPI está habilitado en los routers cEdge\n"
+                f"  • Hay tráfico activo en la red\n"
+                f"  • Los dispositivos están reportando estadísticas a vManage"
+            )
+        
+        # Limitar flujos si hay muchos (para performance)
+        if len(dpi_flows) > limite_flujos:
+            dpi_flows = dpi_flows[:limite_flujos]
+            resultado_texto += f"⚠️  Procesando primeros {limite_flujos} flujos (de {len(result['data'])} totales)\n"
+        
+        resultado_texto += f"✅ {len(dpi_flows)} flujos DPI encontrados\n\n"
+        
+        # Agregar datos por aplicación
+        apps_agregadas = {}
+        dispositivos_unicos = set()
+        vpns_detectadas = set()
+        ips_origen = set()
+        ips_destino = set()
+        
+        for flow in dpi_flows:
+            app_name = flow.get('application', 'unknown')
+            familia = flow.get('family', 'N/A')
+            hostname = flow.get('host_name', 'Unknown')
+            vpn_id = str(flow.get('vpn_id', 'N/A'))
+            source_ip = flow.get('source_ip', '')
+            dest_ip = flow.get('dest_ip', '')
+            
+            # Recolectar estadísticas globales
+            dispositivos_unicos.add(hostname)
+            if vpn_id != 'N/A':
+                vpns_detectadas.add(vpn_id)
+            if source_ip:
+                ips_origen.add(source_ip)
+            if dest_ip:
+                ips_destino.add(dest_ip)
+            
+            # Agregar por aplicación
+            if app_name not in apps_agregadas:
+                apps_agregadas[app_name] = {
+                    'aplicacion': app_name,
+                    'familia': familia,
+                    'total_bytes': 0,
+                    'total_packets': 0,
+                    'flujos': 0,
+                    'dispositivos': set(),
+                    'vpns': set(),
+                    'ips_origen_top': {},
+                    'ips_destino_top': {}
+                }
+            
+            # Sumar estadísticas
+            octets = int(flow.get('octets', 0))
+            packets = int(flow.get('packets', 0))
+            
+            apps_agregadas[app_name]['total_bytes'] += octets
+            apps_agregadas[app_name]['total_packets'] += packets
+            apps_agregadas[app_name]['flujos'] += 1
+            apps_agregadas[app_name]['dispositivos'].add(hostname)
+            
+            if vpn_id != 'N/A':
+                apps_agregadas[app_name]['vpns'].add(vpn_id)
+            
+            # Trackear top IPs origen y destino por aplicación
+            if source_ip:
+                apps_agregadas[app_name]['ips_origen_top'][source_ip] = \
+                    apps_agregadas[app_name]['ips_origen_top'].get(source_ip, 0) + octets
+            if dest_ip:
+                apps_agregadas[app_name]['ips_destino_top'][dest_ip] = \
+                    apps_agregadas[app_name]['ips_destino_top'].get(dest_ip, 0) + octets
+        
+        # Ordenar aplicaciones por bytes
+        apps_list = list(apps_agregadas.values())
+        apps_list.sort(key=lambda x: x['total_bytes'], reverse=True)
+        
+        top_apps = apps_list[:top]
+        total_bytes_red = sum(app['total_bytes'] for app in apps_list)
+        
+        # Formatear total de red
+        if total_bytes_red > 1024**4:  # TB
+            total_str = f"{total_bytes_red / (1024**4):.2f} TB"
+        elif total_bytes_red > 1024**3:  # GB
+            total_str = f"{total_bytes_red / (1024**3):.2f} GB"
+        elif total_bytes_red > 1024**2:  # MB
+            total_str = f"{total_bytes_red / (1024**2):.2f} MB"
+        else:
+            total_str = f"{total_bytes_red / 1024:.2f} KB"
+        
+        resultado_texto += f"📈 TRÁFICO TOTAL ANALIZADO: {total_str}\n"
+        resultado_texto += f"🖥️  DISPOSITIVOS: {len(dispositivos_unicos)}\n"
+        resultado_texto += f"🌐 VPNs: {', '.join(sorted(vpns_detectadas))}\n"
+        resultado_texto += f"📍 IPs Origen únicas: {len(ips_origen)}\n"
+        resultado_texto += f"📍 IPs Destino únicas: {len(ips_destino)}\n"
+        resultado_texto += f"🔢 Aplicaciones únicas: {len(apps_list)}\n\n"
+        resultado_texto += f"{'='*80}\n\n"
+        
+        # Tabla de aplicaciones
+        resultado_texto += f"{'#':<4} {'APLICACIÓN':<25} {'TRÁFICO':<15} {'%':<8} {'FLUJOS':<8} {'DISPOS':<7} {'VPNs':<8}\n"
+        resultado_texto += f"{'-'*4} {'-'*25} {'-'*15} {'-'*8} {'-'*8} {'-'*7} {'-'*8}\n"
+        
+        for i, app in enumerate(top_apps, 1):
+            # Calcular porcentaje
+            porcentaje = (app['total_bytes'] / total_bytes_red * 100) if total_bytes_red > 0 else 0
+            
+            # Formatear bytes
+            bytes_val = app['total_bytes']
+            if bytes_val > 1024**4:  # TB
+                bytes_str = f"{bytes_val / (1024**4):.2f} TB"
+            elif bytes_val > 1024**3:  # GB
+                bytes_str = f"{bytes_val / (1024**3):.2f} GB"
+            elif bytes_val > 1024**2:  # MB
+                bytes_str = f"{bytes_val / (1024**2):.2f} MB"
+            else:
+                bytes_str = f"{bytes_val / 1024:.2f} KB"
+            
+            # Formatear flujos
+            flujos_val = app['flujos']
+            if flujos_val > 1000:
+                flujos_str = f"{flujos_val / 1000:.1f}K"
+            else:
+                flujos_str = str(flujos_val)
+            
+            # Número de dispositivos y VPNs
+            num_devices = len(app['dispositivos'])
+            num_vpns = len(app['vpns'])
+            vpns_str = ','.join(sorted(list(app['vpns']))[:3])
+            
+            # Nombre de aplicación (truncar si es muy largo)
+            app_name = app['aplicacion'][:23]
+            
+            resultado_texto += f"{i:<4} {app_name:<25} {bytes_str:<15} {porcentaje:>6.2f}% {flujos_str:<8} {num_devices:<7} {vpns_str:<8}\n"
+        
+        resultado_texto += f"\n{'='*80}\n"
+        
+        # Mostrar top IPs destino para las primeras aplicaciones
+        resultado_texto += f"\n📌 TOP IPs DESTINO POR APLICACIÓN:\n\n"
+        for i, app in enumerate(top_apps[:top], 1):
+            if not app['ips_destino_top']:
+                continue
+            resultado_texto += f"{i}. {app['aplicacion']}:\n"
+            
+            # Top 5 IPs destino
+            top_dest_ips = sorted(app['ips_destino_top'].items(), key=lambda x: x[1], reverse=True)[:5]
+            for ip, bytes_val in top_dest_ips:
+                if bytes_val > 1024**3:
+                    bytes_str = f"{bytes_val / (1024**3):.2f} GB"
+                elif bytes_val > 1024**2:
+                    bytes_str = f"{bytes_val / (1024**2):.1f} MB"
+                else:
+                    bytes_str = f"{bytes_val / 1024:.1f} KB"
+                resultado_texto += f"   • {ip:15} - {bytes_str}\n"
+            resultado_texto += "\n"
+        
+        # Resumen adicional
+        if len(apps_list) > top:
+            otras_apps = len(apps_list) - top
+            otras_bytes = sum(app['total_bytes'] for app in apps_list[top:])
+            otras_porcentaje = (otras_bytes / total_bytes_red * 100) if total_bytes_red > 0 else 0
+            
+            if otras_bytes > 1024**3:  # GB
+                otras_str = f"{otras_bytes / (1024**3):.2f} GB"
+            elif otras_bytes > 1024**2:  # MB
+                otras_str = f"{otras_bytes / (1024**2):.2f} MB"
+            else:
+                otras_str = f"{otras_bytes / 1024:.2f} KB"
+            
+            resultado_texto += f"\n💡 Otras {otras_apps} aplicaciones: {otras_str} ({otras_porcentaje:.2f}%)\n"
+        
+        resultado_texto += f"\n🔧 HERRAMIENTAS RELACIONADAS:\n"
+        resultado_texto += f"  • ver_aplicaciones_top(device_id, top=10) - Apps de un dispositivo específico\n"
+        resultado_texto += f"  • obtener_ips_destino_aplicacion(aplicacion) - IPs destino detalladas de una app\n"
+        resultado_texto += f"  • ver_aplicaciones_agregadas_avanzado(...) - Análisis con filtros avanzados\n"
+        
+        return resultado_texto
+        
+    except Exception as e:
+        return f"❌ Error al obtener aplicaciones top de la red: {str(e)}"
+
+
+@mcp.tool()
+def ver_aplicaciones_agregadas_avanzado(
+    horas: int = 1,
+    dispositivos: str = "",
+    familias: str = "",
+    top_familias: int = 10,
+    intervalo_minutos: int = 10
+) -> str:
+    """
+    Análisis avanzado de aplicaciones DPI con agregación temporal y filtros personalizados.
+    Usa el endpoint POST /dataservice/statistics/dpi/aggregation para consultas avanzadas.
+    
+    Permite filtrar por tiempo, dispositivos específicos y familias de aplicaciones,
+    con histogramas temporales para ver evolución del tráfico.
+    
+    Args:
+        horas: Número de horas hacia atrás para el análisis (default: 1, máximo recomendado: 24)
+        dispositivos: Lista de System IPs o hostnames separados por coma (ej: "10.95.0.3,10.95.1.3")
+                     Si está vacío, consulta todos los dispositivos
+        familias: Lista de familias de aplicaciones separadas por coma 
+                 (ej: "web,network-service,webmail,video,streaming,social-networking")
+                 Si está vacío, consulta todas las familias
+        top_familias: Número de familias top a mostrar (default: 10)
+        intervalo_minutos: Intervalo en minutos para el histograma temporal (default: 10)
+    
+    Returns:
+        Análisis agregado de tráfico por familia con evolución temporal
+        
+    Ejemplo:
+        ver_aplicaciones_agregadas_avanzado(horas=6, familias="web,video,social-networking", top_familias=5)
+        ver_aplicaciones_agregadas_avanzado(horas=1, dispositivos="10.95.0.3", intervalo_minutos=5)
+    """
+    print(f"\n🔧 [{datetime.now().strftime('%H:%M:%S')}] HERRAMIENTA INVOCADA: ver_aplicaciones_agregadas_avanzado", file=sys.stderr)
+    try:
+        session = get_vmanage_session()
+        
+        resultado_texto = f"📊 ANÁLISIS AVANZADO DE APLICACIONES DPI\n"
+        resultado_texto += f"{'='*80}\n\n"
+        
+        # Construir query
+        query_rules = [
+            {
+                "value": [str(horas)],
+                "field": "entry_time",
+                "type": "date",
+                "operator": "last_n_hours"
+            }
+        ]
+        
+        # Agregar filtro de dispositivos si se especifica
+        if dispositivos:
+            device_list = [d.strip() for d in dispositivos.split(',')]
+            
+            # Resolver nombres de dispositivo a System IPs si es necesario
+            devices_result = session.get("/dataservice/device")
+            if 'data' in devices_result:
+                resolved_devices = []
+                for dev_input in device_list:
+                    # Buscar por hostname o system-ip
+                    for device in devices_result['data']:
+                        if (dev_input in device.get('host-name', '') or 
+                            dev_input == device.get('system-ip', '') or
+                            dev_input == device.get('uuid', '')):
+                            resolved_devices.append(device.get('system-ip', ''))
+                            break
+                
+                if resolved_devices:
+                    query_rules.append({
+                        "value": resolved_devices,
+                        "field": "vdevice_name",
+                        "type": "string",
+                        "operator": "in"
+                    })
+                    resultado_texto += f"🎯 Dispositivos filtrados: {', '.join(resolved_devices)}\n"
+        
+        # Agregar filtro de familias si se especifica
+        if familias:
+            family_list = [f.strip() for f in familias.split(',')]
+            query_rules.append({
+                "value": family_list,
+                "field": "family",
+                "type": "string",
+                "operator": "in"
+            })
+            resultado_texto += f"📁 Familias filtradas: {', '.join(family_list)}\n"
+        
+        resultado_texto += f"⏰ Período: Últimas {horas} hora(s)\n"
+        resultado_texto += f"📊 Intervalo: {intervalo_minutos} minutos\n\n"
+        
+        # Construir payload POST
+        payload = {
+            "query": {
+                "condition": "AND",
+                "rules": query_rules
+            },
+            "aggregation": {
+                "field": [
+                    {
+                        "property": "family",
+                        "sequence": 1,
+                        "size": top_familias
+                    }
+                ],
+                "metrics": [
+                    {
+                        "property": "octets",
+                        "type": "sum"
+                    }
+                ],
+                "histogram": {
+                    "property": "entry_time",
+                    "type": "minute",
+                    "interval": intervalo_minutos,
+                    "order": "asc"
+                }
+            }
+        }
+        
+        # Realizar petición POST
+        endpoint = "/dataservice/statistics/dpi/aggregation"
+        result = session.post(endpoint, payload, timeout=60)
+        
+        if 'data' not in result or not result['data']:
+            return (
+                f"{resultado_texto}\n"
+                f"ℹ️  No hay datos disponibles para los filtros especificados\n\n"
+                f"Verifica:\n"
+                f"  • Los dispositivos tienen DPI habilitado\n"
+                f"  • Hay tráfico en el período seleccionado\n"
+                f"  • Los nombres de familias son correctos"
+            )
+        
+        data_points = result['data']
+        entry_time_list = result.get('entryTimeList', [])
+        
+        resultado_texto += f"✅ {len(data_points)} puntos de datos recibidos\n"
+        resultado_texto += f"🕐 {len(entry_time_list)} intervalos temporales\n\n"
+        resultado_texto += f"{'='*80}\n\n"
+        
+        # Agregar por familia
+        familias_agregadas = {}
+        
+        for point in data_points:
+            familia = point.get('family', 'unknown')
+            octets = int(point.get('octets', 0))
+            count = int(point.get('count', 0))
+            entry_time = point.get('entry_time', 0)
+            
+            if familia not in familias_agregadas:
+                familias_agregadas[familia] = {
+                    'familia': familia,
+                    'total_bytes': 0,
+                    'total_count': 0,
+                    'timeline': {}
+                }
+            
+            familias_agregadas[familia]['total_bytes'] += octets
+            familias_agregadas[familia]['total_count'] += count
+            familias_agregadas[familia]['timeline'][entry_time] = octets
+        
+        # Ordenar familias por bytes totales
+        familias_sorted = sorted(familias_agregadas.values(), key=lambda x: x['total_bytes'], reverse=True)
+        
+        total_bytes = sum(f['total_bytes'] for f in familias_sorted)
+        
+        # Formatear total
+        if total_bytes > 1024**4:  # TB
+            total_str = f"{total_bytes / (1024**4):.2f} TB"
+        elif total_bytes > 1024**3:  # GB
+            total_str = f"{total_bytes / (1024**3):.2f} GB"
+        elif total_bytes > 1024**2:  # MB
+            total_str = f"{total_bytes / (1024**2):.2f} MB"
+        else:
+            total_str = f"{total_bytes / 1024:.2f} KB"
+        
+        resultado_texto += f"📈 TRÁFICO TOTAL: {total_str}\n\n"
+        
+        # Tabla de familias
+        resultado_texto += f"{'#':<4} {'FAMILIA':<30} {'TRÁFICO':<15} {'%':<8} {'FLUJOS':<10}\n"
+        resultado_texto += f"{'-'*4} {'-'*30} {'-'*15} {'-'*8} {'-'*10}\n"
+        
+        for i, fam in enumerate(familias_sorted[:top_familias], 1):
+            # Calcular porcentaje
+            porcentaje = (fam['total_bytes'] / total_bytes * 100) if total_bytes > 0 else 0
+            
+            # Formatear bytes
+            bytes_val = fam['total_bytes']
+            if bytes_val > 1024**4:  # TB
+                bytes_str = f"{bytes_val / (1024**4):.2f} TB"
+            elif bytes_val > 1024**3:  # GB
+                bytes_str = f"{bytes_val / (1024**3):.2f} GB"
+            elif bytes_val > 1024**2:  # MB
+                bytes_str = f"{bytes_val / (1024**2):.2f} MB"
+            else:
+                bytes_str = f"{bytes_val / 1024:.2f} KB"
+            
+            # Formatear conteo
+            count_val = fam['total_count']
+            if count_val > 1000:
+                count_str = f"{count_val / 1000:.1f}K"
+            else:
+                count_str = str(count_val)
+            
+            familia_name = fam['familia'][:28]
+            
+            resultado_texto += f"{i:<4} {familia_name:<30} {bytes_str:<15} {porcentaje:>6.2f}% {count_str:<10}\n"
+        
+        resultado_texto += f"\n{'='*80}\n"
+        
+        # Mostrar evolución temporal de top 3 familias
+        if entry_time_list and len(familias_sorted) > 0:
+            resultado_texto += f"\n📈 EVOLUCIÓN TEMPORAL (Top 3 Familias):\n\n"
+            
+            # Convertir timestamps a formato legible
+            time_labels = []
+            for ts in entry_time_list[:10]:  # Mostrar primeros 10 intervalos
+                dt = datetime.fromtimestamp(ts / 1000)
+                time_labels.append(dt.strftime('%H:%M'))
+            
+            resultado_texto += f"{'Familia':<25} | {' | '.join([f'{t:>8}' for t in time_labels])}\n"
+            resultado_texto += f"{'-'*25}-+-{'-+-'.join(['-'*8 for _ in time_labels])}\n"
+            
+            for fam in familias_sorted[:3]:
+                familia_name = fam['familia'][:23]
+                timeline_values = []
+                
+                for ts in entry_time_list[:10]:
+                    bytes_val = fam['timeline'].get(ts, 0)
+                    if bytes_val > 1024**2:  # MB
+                        val_str = f"{bytes_val / (1024**2):.1f}MB"
+                    elif bytes_val > 1024:  # KB
+                        val_str = f"{bytes_val / 1024:.1f}KB"
+                    else:
+                        val_str = f"{bytes_val}B" if bytes_val > 0 else "-"
+                    timeline_values.append(f"{val_str:>8}")
+                
+                resultado_texto += f"{familia_name:<25} | {' | '.join(timeline_values)}\n"
+            
+            resultado_texto += f"\n"
+        
+        resultado_texto += f"💡 FAMILIAS COMUNES:\n"
+        resultado_texto += f"  • web - Navegación HTTP/HTTPS\n"
+        resultado_texto += f"  • network-service - DNS, DHCP, NTP\n"
+        resultado_texto += f"  • video - YouTube, Netflix, streaming\n"
+        resultado_texto += f"  • social-networking - Facebook, Twitter, Instagram\n"
+        resultado_texto += f"  • file-sharing - Transferencias de archivos\n"
+        resultado_texto += f"  • encrypted - Tráfico cifrado sin identificar\n"
+        
+        return resultado_texto
+        
+    except Exception as e:
+        return f"❌ Error en análisis agregado: {str(e)}"
+
+
+@mcp.tool()
 def buscar_dispositivo(criterio: str) -> str:
     """
     Busca dispositivos por nombre, IP, modelo, site-id o cualquier criterio
@@ -1061,653 +1931,1039 @@ def ver_eventos_seguridad(horas: int = 24) -> str:
 
 
 @mcp.tool()
-def diagnostico_completo_dispositivo(device_id: str) -> str:
+def obtener_ips_destino_aplicacion(
+    aplicacion: str,
+    top_ips: int = 20
+) -> str:
     """
-    Realiza un diagnóstico completo de un dispositivo combinando múltiples métricas
+    Obtiene las IPs destino más comunes para una aplicación específica.
+    
+    Busca en todos los flujos DPI de la red y filtra por la aplicación solicitada,
+    mostrando las IPs destino con más tráfico, puertos utilizados, consumo total,
+    los sitios/dispositivos involucrados y las IPs origen que generan ese tráfico.
     
     Args:
-        device_id: System IP del dispositivo (ejemplo: 10.80.10.207)
+        aplicacion: Nombre de la aplicación (ej: "adobe-services", "microsoft-teams", "ssl", "torrent", "tor")
+        top_ips: Número máximo de IPs destino a mostrar (default: 20)
     
     Returns:
-        Diagnóstico completo: salud, recursos, conectividad, interfaces, alarmas
+        Lista de IPs destino con estadísticas detalladas de tráfico, puertos y consumo
     """
     try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Buscando IPs destino de '{aplicacion}'...", file=sys.stderr)
+        
         session = get_vmanage_session()
         
-        diagnostico = {
-            'device_id': device_id,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        
-        # 1. Información básica
-        device_info = session.get(f"/dataservice/device?system-ip={device_id}")
-        if 'data' in device_info and len(device_info['data']) > 0:
-            device = device_info['data'][0]
-            diagnostico['info_basica'] = {
-                'hostname': device.get('host-name', 'N/A'),
-                'tipo': device.get('device-type', 'N/A'),
-                'modelo': device.get('device-model', 'N/A'),
-                'site_id': device.get('site-id', 'N/A'),
-                'estado': device.get('reachability', 'N/A'),
-                'version': device.get('version', 'N/A'),
-                'uptime': device.get('uptime-date', 'N/A')
-            }
-        
-        # 2. CPU y Memoria
-        try:
-            system_status = session.get(f"/dataservice/device/system/status?deviceId={device_id}")
-            if 'data' in system_status and len(system_status['data']) > 0:
-                sys_data = system_status['data'][0]
-                cpu_idle = float(sys_data.get('cpu-idle', 100))
-                diagnostico['recursos'] = {
-                    'cpu_usado_percent': f"{100 - cpu_idle:.2f}",
-                    'memoria_usada_percent': sys_data.get('mem-used-percent', 'N/A'),
-                    'disco_usado_percent': sys_data.get('disk-used', 'N/A')
-                }
-        except:
-            diagnostico['recursos'] = 'No disponible'
-        
-        # 3. Interfaces con problemas
-        try:
-            interfaces = session.get(f"/dataservice/device/interface/stats?deviceId={device_id}")
-            if 'data' in interfaces:
-                interfaces_down = []
-                interfaces_errores = []
-                
-                for iface in interfaces['data']:
-                    if iface.get('if-oper-status') != 'if-oper-state-ready':
-                        interfaces_down.append(iface.get('interface', 'N/A'))
-                    
-                    rx_errors = int(iface.get('rx-errors', 0))
-                    tx_errors = int(iface.get('tx-errors', 0))
-                    if rx_errors > 0 or tx_errors > 0:
-                        interfaces_errores.append({
-                            'interface': iface.get('interface', 'N/A'),
-                            'rx_errors': rx_errors,
-                            'tx_errors': tx_errors
-                        })
-                
-                diagnostico['interfaces'] = {
-                    'total': len(interfaces['data']),
-                    'caidas': interfaces_down,
-                    'con_errores': interfaces_errores
-                }
-        except:
-            diagnostico['interfaces'] = 'No disponible'
-        
-        # 4. Control connections
-        try:
-            control = session.get(f"/dataservice/device/control/connections?deviceId={device_id}")
-            if 'data' in control:
-                up_count = sum(1 for c in control['data'] if c.get('state') == 'up')
-                diagnostico['control_plane'] = {
-                    'total_connections': len(control['data']),
-                    'activas': up_count,
-                    'estado': 'OK' if up_count > 0 else 'PROBLEMA'
-                }
-        except:
-            diagnostico['control_plane'] = 'No disponible'
-        
-        # 5. Alarmas activas del dispositivo
-        try:
-            alarms = session.get("/dataservice/alarms")
-            if 'data' in alarms:
-                device_alarms = [a for a in alarms['data'] 
-                               if a.get('system-ip') == device_id and a.get('active')]
-                
-                critical_count = sum(1 for a in device_alarms if a.get('severity') == 'Critical')
-                major_count = sum(1 for a in device_alarms if a.get('severity') == 'Major')
-                
-                diagnostico['alarmas'] = {
-                    'total': len(device_alarms),
-                    'criticas': critical_count,
-                    'mayores': major_count
-                }
-        except:
-            diagnostico['alarmas'] = 'No disponible'
-        
-        # Evaluación general
-        problemas = []
-        if diagnostico.get('info_basica', {}).get('estado') != 'reachable':
-            problemas.append('❌ Dispositivo NO alcanzable')
-        
-        if diagnostico.get('recursos') != 'No disponible':
-            try:
-                cpu = float(diagnostico['recursos']['cpu_usado_percent'])
-                if cpu > 80:
-                    problemas.append(f'⚠️  CPU alta: {cpu}%')
-            except:
-                pass
-        
-        if diagnostico.get('control_plane', {}).get('estado') != 'OK':
-            problemas.append('❌ Sin conexiones al control plane')
-        
-        if diagnostico.get('alarmas', {}).get('criticas', 0) > 0:
-            problemas.append(f"🔴 {diagnostico['alarmas']['criticas']} alarmas críticas")
-        
-        diagnostico['evaluacion'] = {
-            'estado_general': 'SALUDABLE' if not problemas else 'CON PROBLEMAS',
-            'problemas_detectados': problemas if problemas else ['✅ Sin problemas detectados']
-        }
-        
-        return (
-            f"🔍 DIAGNÓSTICO COMPLETO - Dispositivo {device_id}\n\n"
-            f"Estado General: {diagnostico['evaluacion']['estado_general']}\n\n"
-            f"Problemas:\n{diagnostico['evaluacion']['problemas_detectados']}\n\n"
-            f"Detalle completo:\n{diagnostico}"
-        )
-        
-    except Exception as e:
-        return f"Error al realizar diagnóstico: {str(e)}"
-
-
-@mcp.tool()
-def analizar_trafico_total_red(horas: int = 12) -> str:
-    """
-    Analiza el tráfico de aplicaciones en toda la red SD-WAN usando Cisco Analytics Cloud.
-    Obtiene datos agregados de todas las aplicaciones detectadas por DPI en la red completa.
-    
-    Args:
-        horas: Ventana de tiempo en horas para el análisis (default: 12)
-    
-    Returns:
-        Top aplicaciones por consumo de ancho de banda con estadísticas de QoE
-    """
-    try:
-        analytics = get_analytics_session()
-        
-        # Analytics Cloud usa ventanas de tiempo pre-computadas específicas
-        # Por ahora usamos la última ventana disponible conocida
-        # TODO: Implementar llamada para obtener ventanas disponibles dinámicamente
-        from datetime import datetime, timedelta
-        
-        payload = {
-            "time_frame": "12h",
-            "entry_ts": {
-                "start": "2026-02-04 05:00:00",
-                "end": "2026-02-04 17:05:00"
-            }
-        }
-        
-        start_time = payload["entry_ts"]["start"]
-        end_time = payload["entry_ts"]["end"]
-        
-        # Obtener datos de Analytics
-        endpoint = "/analytics/api/v4/dataservice/aggregate/applications"
-        result = analytics.post(endpoint, json_data=payload, timeout=30)
+        # Obtener flujos DPI de toda la red
+        result = session.get("/dataservice/statistics/dpi", timeout=60)
         
         if 'data' not in result or not result['data']:
-            return f"⚠️  No hay datos de aplicaciones disponibles para las últimas {horas} horas.\nVerifica que DPI esté habilitado y haya tráfico clasificado."
+            return f"❌ No hay datos DPI disponibles en este momento"
         
-        apps = result['data']
-        total_apps = result.get('count', len(apps))
+        dpi_flows = result['data']
+        total_flows = len(dpi_flows)
         
-        # Ordenar por usage (bytes totales)
-        apps_sorted = sorted(apps, key=lambda x: x.get('usage', 0), reverse=True)
+        # Filtrar por aplicación (búsqueda flexible)
+        app_lower = aplicacion.lower()
+        flujos_app = [f for f in dpi_flows if app_lower in f.get('application', '').lower()]
         
-        # Calcular total de tráfico
-        total_bytes = sum(app.get('usage', 0) for app in apps)
+        if not flujos_app:
+            # Buscar también en familia
+            flujos_app = [f for f in dpi_flows if app_lower in f.get('family', '').lower()]
         
-        # Generar reporte
-        resultado = (
-            f"🌐 ANÁLISIS DE TRÁFICO - RED COMPLETA\n\n"
-            f"Período: Últimas {horas} horas\n"
-            f"Ventana: {start_time} a {end_time}\n"
-            f"Total de aplicaciones: {total_apps}\n"
-            f"Tráfico total: {total_bytes / (1024**4):.2f} TB\n\n"
-            f"🏆 TOP 20 APLICACIONES:\n"
-        )
-        
-        for i, app in enumerate(apps_sorted[:20], 1):
-            name = app.get('application', 'Unknown')
-            family = app.get('application_family_long_name', 'N/A')
-            usage = app.get('usage', 0)
-            usage_gb = usage / (1024**3)
-            percent = (usage / total_bytes * 100) if total_bytes > 0 else 0
-            site_count = app.get('site_count', 0)
+        if not flujos_app:
+            # Mostrar aplicaciones similares
+            todas_apps = set(f.get('application', '') for f in dpi_flows)
+            similares = [a for a in todas_apps if any(p in a.lower() for p in app_lower.split('-'))]
             
-            # Métricas de QoE
-            latency = app.get('latency', 0)
-            jitter = app.get('jitter', 0)
-            packet_loss = app.get('packet_loss', 0)
-            vqoe_score = app.get('vqoe_score', 0)
-            vqoe_status = app.get('vqoe_status', 'unknown')
-            
-            # Indicador de calidad
-            if vqoe_status == 'unknown' or vqoe_score == 0:
-                quality = "⚪"
-            elif vqoe_score >= 8:
-                quality = "🟢"
-            elif vqoe_score >= 5:
-                quality = "🟡"
+            resultado = f"❌ No se encontraron flujos para '{aplicacion}'\n\n"
+            if similares:
+                resultado += f"📋 Aplicaciones similares encontradas:\n"
+                for app in sorted(similares)[:15]:
+                    resultado += f"   • {app}\n"
             else:
-                quality = "🔴"
+                resultado += f"📋 Aplicaciones disponibles (primeras 30):\n"
+                for app in sorted(list(todas_apps))[:30]:
+                    resultado += f"   • {app}\n"
+            return resultado
+        
+        # Mapeo de protocolo IP
+        proto_map = {'6': 'TCP', '17': 'UDP', '1': 'ICMP', '47': 'GRE', '50': 'ESP'}
+        
+        # Agregar datos
+        ips_destino = {}
+        ips_origen = {}
+        puertos_destino = {}
+        puertos_origen = {}
+        dispositivos = set()
+        sitios = set()
+        total_bytes_app = 0
+        total_packets_app = 0
+        protocolos = {}
+        app_real_name = flujos_app[0].get('application', aplicacion)
+        familia = flujos_app[0].get('family', 'N/A')
+        
+        # Lista de conexiones detalladas (origen:puerto → destino:puerto)
+        conexiones = []
+        
+        for flow in flujos_app:
+            dest_ip = flow.get('dest_ip', '')
+            source_ip = flow.get('source_ip', '')
+            dest_port = str(flow.get('dest_port', ''))
+            source_port = str(flow.get('source_port', ''))
+            ip_proto = str(flow.get('ip_proto', ''))
+            octets = int(flow.get('octets', 0))
+            packets = int(flow.get('packets', 0))
+            hostname = flow.get('host_name', 'Unknown')
+            site_id = str(flow.get('site_id', 'N/A'))
+            vpn_id = str(flow.get('vpn_id', 'N/A'))
             
-            resultado += f"\n{i}. {name} {quality}"
-            resultado += f"\n   Familia: {family}"
-            resultado += f"\n   Uso: {usage_gb:.2f} GB ({percent:.1f}%)"
-            resultado += f"\n   Sitios: {site_count}"
+            total_bytes_app += octets
+            total_packets_app += packets
+            dispositivos.add(hostname)
+            sitios.add(site_id)
             
-            if vqoe_status != 'unknown' and vqoe_score > 0:
-                resultado += f"\n   QoE: {vqoe_score:.1f}/10 | Latencia: {latency:.1f}ms | Jitter: {jitter:.2f}ms | Pérdida: {packet_loss:.2f}%"
+            # Contar protocolos
+            proto_name = proto_map.get(ip_proto, ip_proto)
+            protocolos[proto_name] = protocolos.get(proto_name, 0) + 1
+            
+            # Registrar conexión detallada
+            conexiones.append({
+                'src_ip': source_ip, 'src_port': source_port,
+                'dst_ip': dest_ip, 'dst_port': dest_port,
+                'proto': proto_name, 'bytes': octets, 'packets': packets,
+                'hostname': hostname, 'site_id': site_id, 'vpn_id': vpn_id
+            })
+            
+            # Agregar puertos destino
+            if dest_port:
+                if dest_port not in puertos_destino:
+                    puertos_destino[dest_port] = {'bytes': 0, 'flujos': 0, 'proto': proto_name}
+                puertos_destino[dest_port]['bytes'] += octets
+                puertos_destino[dest_port]['flujos'] += 1
+            
+            # Agregar puertos origen
+            if source_port:
+                if source_port not in puertos_origen:
+                    puertos_origen[source_port] = {'bytes': 0, 'flujos': 0, 'proto': proto_name}
+                puertos_origen[source_port]['bytes'] += octets
+                puertos_origen[source_port]['flujos'] += 1
+            
+            # Agregar IPs destino
+            if dest_ip:
+                if dest_ip not in ips_destino:
+                    ips_destino[dest_ip] = {
+                        'bytes': 0, 'packets': 0, 'flujos': 0,
+                        'dispositivos': set(), 'sitios': set(),
+                        'vpns': set(), 'ips_origen': set(),
+                        'puertos': set()
+                    }
+                ips_destino[dest_ip]['bytes'] += octets
+                ips_destino[dest_ip]['packets'] += packets
+                ips_destino[dest_ip]['flujos'] += 1
+                ips_destino[dest_ip]['dispositivos'].add(hostname)
+                ips_destino[dest_ip]['sitios'].add(site_id)
+                ips_destino[dest_ip]['vpns'].add(vpn_id)
+                if dest_port:
+                    ips_destino[dest_ip]['puertos'].add(dest_port)
+                if source_ip:
+                    ips_destino[dest_ip]['ips_origen'].add(source_ip)
+            
+            # Agregar IPs origen
+            if source_ip:
+                if source_ip not in ips_origen:
+                    ips_origen[source_ip] = {'bytes': 0, 'flujos': 0, 'puertos': set()}
+                ips_origen[source_ip]['bytes'] += octets
+                ips_origen[source_ip]['flujos'] += 1
+                if source_port:
+                    ips_origen[source_ip]['puertos'].add(source_port)
+        
+        # Formatear bytes
+        def fmt_bytes(b):
+            if b > 1024**3: return f"{b / (1024**3):.2f} GB"
+            if b > 1024**2: return f"{b / (1024**2):.2f} MB"
+            if b > 1024: return f"{b / 1024:.1f} KB"
+            return f"{b} B"
+        
+        # Construir resultado
+        resultado = f"🎯 IPs DESTINO DE: {app_real_name}\n"
+        resultado += f"{'='*100}\n\n"
+        
+        # === CONSUMO TOTAL ===
+        resultado += f"📊 CONSUMO TOTAL:\n"
+        resultado += f"   Aplicación:       {app_real_name}\n"
+        resultado += f"   Familia:          {familia}\n"
+        resultado += f"   Tráfico total:    {fmt_bytes(total_bytes_app)}\n"
+        resultado += f"   Paquetes totales: {total_packets_app:,}\n"
+        resultado += f"   Flujos activos:   {len(flujos_app)} (de {total_flows} totales en la red)\n"
+        resultado += f"   Protocolos:       {', '.join(f'{k}({v})' for k, v in sorted(protocolos.items(), key=lambda x: x[1], reverse=True))}\n"
+        resultado += f"   Sitios:           {len(sitios)} ({', '.join(sorted(sitios))})\n"
+        resultado += f"   Dispositivos:     {len(dispositivos)} ({', '.join(sorted(dispositivos))})\n"
+        resultado += f"   IPs destino:      {len(ips_destino)} únicas\n"
+        resultado += f"   IPs origen:       {len(ips_origen)} únicas\n"
+        resultado += f"   Puertos destino:  {len(puertos_destino)} únicos\n"
+        resultado += f"   Puertos origen:   {len(puertos_origen)} únicos\n\n"
+        
+        # === PUERTOS DESTINO ===
+        sorted_ports_dst = sorted(puertos_destino.items(), key=lambda x: x[1]['bytes'], reverse=True)
+        resultado += f"{'='*100}\n"
+        resultado += f"🔌 PUERTOS DESTINO UTILIZADOS ({len(sorted_ports_dst)}):\n\n"
+        resultado += f"{'PUERTO':<10} {'PROTOCOLO':<10} {'TRÁFICO':<12} {'FLUJOS':<8} {'% TRÁFICO':<10}\n"
+        resultado += f"{'-'*55}\n"
+        
+        for port, data in sorted_ports_dst[:15]:
+            pct = (data['bytes'] / total_bytes_app * 100) if total_bytes_app > 0 else 0
+            resultado += f"{port:<10} {data['proto']:<10} {fmt_bytes(data['bytes']):<12} {data['flujos']:<8} {pct:>6.1f}%\n"
+        
+        # === PUERTOS ORIGEN ===
+        sorted_ports_src = sorted(puertos_origen.items(), key=lambda x: x[1]['bytes'], reverse=True)
+        resultado += f"\n🔌 PUERTOS ORIGEN MÁS ACTIVOS (top 10 de {len(sorted_ports_src)}):\n\n"
+        resultado += f"{'PUERTO':<10} {'PROTOCOLO':<10} {'TRÁFICO':<12} {'FLUJOS':<8}\n"
+        resultado += f"{'-'*45}\n"
+        
+        for port, data in sorted_ports_src[:10]:
+            resultado += f"{port:<10} {data['proto']:<10} {fmt_bytes(data['bytes']):<12} {data['flujos']:<8}\n"
+        
+        # === TOP IPs DESTINO ===
+        sorted_dest = sorted(ips_destino.items(), key=lambda x: x[1]['bytes'], reverse=True)
+        
+        resultado += f"\n{'='*100}\n"
+        resultado += f"📌 TOP {min(top_ips, len(sorted_dest))} IPs DESTINO:\n\n"
+        resultado += f"{'#':<4} {'IP DESTINO':<18} {'TRÁFICO':<12} {'%':<7} {'PUERTOS':<20} {'FLUJOS':<8} {'ORÍGENES':<10}\n"
+        resultado += f"{'-'*100}\n"
+        
+        for i, (ip, data) in enumerate(sorted_dest[:top_ips], 1):
+            pct = (data['bytes'] / total_bytes_app * 100) if total_bytes_app > 0 else 0
+            ports_str = ','.join(sorted(data['puertos'], key=lambda p: int(p) if p.isdigit() else 0)[:5])
+            if len(data['puertos']) > 5:
+                ports_str += f"(+{len(data['puertos'])-5})"
+            num_orig = len(data['ips_origen'])
+            
+            resultado += f"{i:<4} {ip:<18} {fmt_bytes(data['bytes']):<12} {pct:>5.1f}% {ports_str:<20} {data['flujos']:<8} {num_orig:<10}\n"
+        
+        # === TOP IPs ORIGEN ===
+        sorted_orig = sorted(ips_origen.items(), key=lambda x: x[1]['bytes'], reverse=True)
+        
+        resultado += f"\n{'='*100}\n"
+        resultado += f"📍 TOP {min(10, len(sorted_orig))} IPs ORIGEN (quién consume {app_real_name}):\n\n"
+        resultado += f"{'#':<4} {'IP ORIGEN':<18} {'TRÁFICO':<12} {'%':<7} {'PUERTOS':<20} {'FLUJOS':<8}\n"
+        resultado += f"{'-'*75}\n"
+        
+        for i, (ip, data) in enumerate(sorted_orig[:10], 1):
+            pct = (data['bytes'] / total_bytes_app * 100) if total_bytes_app > 0 else 0
+            ports_str = ','.join(sorted(data['puertos'], key=lambda p: int(p) if p.isdigit() else 0)[:5])
+            if len(data['puertos']) > 5:
+                ports_str += f"(+{len(data['puertos'])-5})"
+            resultado += f"{i:<4} {ip:<18} {fmt_bytes(data['bytes']):<12} {pct:>5.1f}% {ports_str:<20} {data['flujos']:<8}\n"
+        
+        # === DETALLE DE CONEXIONES ===
+        conexiones.sort(key=lambda x: x['bytes'], reverse=True)
+        resultado += f"\n{'='*100}\n"
+        resultado += f"🔗 DETALLE DE CONEXIONES (top {min(15, len(conexiones))}):\n\n"
+        resultado += f"{'#':<4} {'ORIGEN':<24} {'DESTINO':<24} {'PROTO':<6} {'TRÁFICO':<12} {'DISPOSITIVO':<25}\n"
+        resultado += f"{'-'*100}\n"
+        
+        for i, conn in enumerate(conexiones[:15], 1):
+            src = f"{conn['src_ip']}:{conn['src_port']}"
+            dst = f"{conn['dst_ip']}:{conn['dst_port']}"
+            resultado += f"{i:<4} {src:<24} {dst:<24} {conn['proto']:<6} {fmt_bytes(conn['bytes']):<12} {conn['hostname']:<25}\n"
+        
+        if len(conexiones) > 15:
+            resultado += f"\n   ... y {len(conexiones) - 15} conexiones más\n"
+        
+        resultado += f"\n{'='*100}\n"
+        resultado += f"💡 Para más detalle usa:\n"
+        resultado += f"   • ver_aplicaciones_top_red_global() - Ranking de todas las apps\n"
+        resultado += f"   • ver_aplicaciones_agregadas_avanzado() - Análisis temporal\n"
         
         return resultado
         
     except Exception as e:
-        # Si falla Analytics, dar mensaje claro
-        error_msg = str(e)
-        if "400" in error_msg or "BAD REQUEST" in error_msg:
-            return (
-                f"⚠️  Error al conectar con Cisco Analytics Cloud.\n\n"
-                f"Por favor:\n"
-                f"1. Abre https://us02.analytics.sdwan.cisco.com en tu navegador\n"
-                f"2. Asegúrate de estar logueado\n"
-                f"3. Vuelve a intentar este comando\n\n"
-                f"Las cookies de Analytics expiran y necesitan renovarse desde el navegador."
-            )
-        else:
-            return f"⚠️  Error al obtener datos: {error_msg}"
+        return f"❌ Error al obtener IPs destino: {str(e)}"
 
+
+# ============================================================================
+# FUNCIONES DE CISCO CATALYST CENTER (DNA Center)
+# ============================================================================
 
 @mcp.tool()
-def analizar_detalle_aplicaciones(aplicaciones: str, top_sitios: int = 10) -> str:
+def catalyst_listar_dispositivos_red() -> str:
     """
-    Proporciona desglose detallado de aplicaciones específicas mostrando:
-    - Uso total por aplicación
-    - Top sitios que más consumen cada aplicación
-    - Dispositivos principales por sitio
-    - Métricas de QoE por sitio
-    
-    Args:
-        aplicaciones: Nombres de aplicaciones separados por comas (ej: "ssl,http,W3-Relaciones-familiare")
-        top_sitios: Cantidad de sitios principales a mostrar por aplicación (default: 10)
+    Lista todos los dispositivos de red gestionados por Catalyst Center (switches, routers, APs, etc.)
     
     Returns:
-        Desglose detallado con tabla por aplicación → sitios → dispositivos
+        Lista completa de dispositivos con información de estado, familia y versión de software
     """
     try:
-        analytics = get_analytics_session()
-        from datetime import datetime, timedelta
+        session = get_catalyst_session()
+        endpoint = "/dna/intent/api/v1/network-device"
+        result = session.get(endpoint, timeout=30)
         
-        payload = {
-            "time_frame": "12h",
-            "entry_ts": {
-                "start": "2026-02-04 05:00:00",
-                "end": "2026-02-04 17:05:00"
-            }
-        }
-        
-        start_time = payload["entry_ts"]["start"]
-        end_time = payload["entry_ts"]["end"]
-        
-        # Obtener datos de aplicaciones
-        endpoint_apps = "/analytics/api/v4/dataservice/aggregate/applications"
-        result_apps = analytics.post(endpoint_apps, json_data=payload, timeout=30)
-        
-        if 'data' not in result_apps or not result_apps['data']:
-            return "⚠️  No hay datos de aplicaciones disponibles."
-        
-        # Obtener datos de sitios
-        endpoint_sites = "/analytics/api/v4/dataservice/aggregate/sites"
-        result_sites = analytics.post(endpoint_sites, json_data=payload, timeout=30)
-        
-        sites_data = result_sites.get('data', [])
-        
-        # Obtener datos de dispositivos
-        endpoint_devices = "/analytics/api/v4/dataservice/aggregate/devices"
-        result_devices = analytics.post(endpoint_devices, json_data=payload, timeout=30)
-        
-        devices_data = result_devices.get('data', [])
-        
-        # Filtrar aplicaciones solicitadas
-        apps_solicitadas = [a.strip().lower() for a in aplicaciones.split(',')]
-        apps_data = [app for app in result_apps['data'] 
-                     if app.get('application', '').lower() in apps_solicitadas]
-        
-        if not apps_data:
-            return f"⚠️  No se encontraron las aplicaciones especificadas: {aplicaciones}\n\nAplicaciones disponibles: {', '.join([a['application'] for a in result_apps['data'][:20]])}"
-        
-        # Generar reporte
-        resultado = (
-            f"📊 ANÁLISIS DETALLADO DE APLICACIONES\n\n"
-            f"Ventana: {start_time} a {end_time}\n"
-            f"Total de sitios: {len(sites_data)}\n"
-            f"Total de dispositivos: {len(devices_data)}\n"
-            f"Aplicaciones analizadas: {len(apps_data)}\n"
-            f"{'='*70}\n"
-        )
-        
-        # Ordenar aplicaciones por uso
-        apps_data_sorted = sorted(apps_data, key=lambda x: x.get('usage', 0), reverse=True)
-        
-        for app in apps_data_sorted:
-            name = app.get('application', 'unknown')
-            family = app.get('application_family_long_name', 'N/A')
-            usage = app.get('usage', 0)
-            usage_gb = usage / (1024**3)
-            site_count = app.get('site_count', 0)
+        if 'response' in result:
+            devices = result['response']
             
-            vqoe_score = app.get('vqoe_score', 0)
-            latency = app.get('latency', 0)
-            jitter = app.get('jitter', 0)
-            packet_loss = app.get('packet_loss', 0)
-            
-            # Indicador de calidad
-            if vqoe_score >= 7:
-                quality = "🟢"
-            elif vqoe_score >= 5:
-                quality = "🟡"
-            else:
-                quality = "🔴"
-            
-            resultado += f"\n\n{'='*70}\n"
-            resultado += f"📱 APLICACIÓN: {name.upper()} {quality}\n"
-            resultado += f"{'='*70}\n"
-            resultado += f"Familia: {family}\n"
-            resultado += f"Uso total: {usage_gb:.2f} GB\n"
-            resultado += f"Sitios usando: {site_count}\n"
-            resultado += f"QoE global: {vqoe_score:.1f}/10 | Latencia: {latency:.1f}ms | "
-            resultado += f"Jitter: {jitter:.2f}ms | Pérdida: {packet_loss:.2f}%\n"
-            
-            # Top sitios para esta aplicación (ordenados por uso total del sitio)
-            resultado += f"\n📍 TOP {min(top_sitios, len(sites_data))} SITIOS CON MAYOR TRÁFICO:\n"
-            resultado += f"{'-'*70}\n"
-            
-            # Ordenar sitios por uso total
-            sites_sorted = sorted(sites_data, key=lambda x: x.get('usage', 0), reverse=True)[:top_sitios]
-            
-            for i, site in enumerate(sites_sorted, 1):
-                site_name = site.get('site_name', site.get('site_id', 'unknown'))
-                site_usage = site.get('usage', 0)
-                site_usage_gb = site_usage / (1024**3)
-                site_qoe = site.get('vqoe_score', 0)
-                site_devices = site.get('device_count', 0)
-                site_city = site.get('city', 'N/A')
-                
-                # Indicador QoE del sitio
-                if site_qoe >= 7:
-                    site_quality = "🟢"
-                elif site_qoe >= 5:
-                    site_quality = "🟡"
-                else:
-                    site_quality = "🔴"
-                
-                resultado += f"\n{i}. {site_name} ({site_city}) {site_quality}\n"
-                resultado += f"   Uso total sitio: {site_usage_gb:.2f} GB\n"
-                resultado += f"   QoE sitio: {site_qoe:.1f}/10\n"
-                resultado += f"   Dispositivos: {site_devices}\n"
-                
-                # Buscar dispositivos de este sitio
-                site_id = site.get('site_id', '')
-                site_devices_list = [d for d in devices_data 
-                                   if d.get('site_id') == site_id or 
-                                   d.get('site_name') == site_name]
-                
-                if site_devices_list:
-                    # Top 3 dispositivos del sitio
-                    devices_sorted = sorted(site_devices_list, 
-                                          key=lambda x: x.get('usage', 0), 
-                                          reverse=True)[:3]
-                    
-                    resultado += f"   \n   🖥️  Dispositivos principales:\n"
-                    for j, dev in enumerate(devices_sorted, 1):
-                        dev_name = dev.get('local_host_name', 'unknown')
-                        dev_ip = dev.get('local_system_ip', 'N/A')
-                        dev_usage = dev.get('usage', 0)
-                        dev_usage_gb = dev_usage / (1024**3)
-                        dev_status = dev.get('availability_status', 'unknown')
-                        
-                        status_icon = "✅" if dev_status == 'up' else "⚠️"
-                        
-                        resultado += f"      {j}. {dev_name} ({dev_ip}) {status_icon}\n"
-                        resultado += f"         Uso: {dev_usage_gb:.2f} GB\n"
-        
-        resultado += f"\n\n{'='*70}\n"
-        resultado += f"💡 NOTA: Los datos mostrados son agregados por sitio.\n"
-        resultado += f"Para IPs origen/destino específicas, accede a:\n"
-        resultado += f"vManage → Monitor → Applications → Application-Aware Routing\n"
-        
-        return resultado
-        
-    except Exception as e:
-        error_msg = str(e)
-        if "400" in error_msg or "BAD REQUEST" in error_msg:
-            return (
-                f"⚠️  Error al conectar con Cisco Analytics Cloud.\n\n"
-                f"Por favor ejecuta: ./refrescar_cookies_analytics.sh\n"
-                f"Luego reinicia Claude Desktop."
-            )
-        else:
-            return f"⚠️  Error al obtener datos: {error_msg}"
-
-
-@mcp.tool()
-def comparar_trafico_sitios(site_id_1: str, site_id_2: str) -> str:
-    """
-    Compara el tráfico de aplicaciones entre dos sitios. Útil para análisis de diferencias de uso entre sucursales.
-    
-    Args:
-        site_id_1: ID del primer sitio a comparar
-        site_id_2: ID del segundo sitio a comparar
-    
-    Returns:
-        Comparación detallada de tráfico entre ambos sitios con aplicaciones únicas y comunes
-    """
-    try:
-        session = get_vmanage_session()
-        
-        # Obtener dispositivos de cada sitio
-        devices_result = session.get("/dataservice/device", timeout=20)
-        
-        if 'data' not in devices_result:
-            return "No se pudieron obtener dispositivos"
-        
-        sitio1_devices = [d for d in devices_result['data'] if d.get('site-id') == site_id_1]
-        sitio2_devices = [d for d in devices_result['data'] if d.get('site-id') == site_id_2]
-        
-        if not sitio1_devices:
-            return f"No se encontraron dispositivos en sitio {site_id_1}"
-        if not sitio2_devices:
-            return f"No se encontraron dispositivos en sitio {site_id_2}"
-        
-        # Función para analizar un sitio
-        def analizar_sitio(devices):
-            apps = {}
+            # Formatear respuesta
+            formatted_devices = []
             for device in devices:
-                device_id = device.get('deviceId') or device.get('uuid')
-                try:
-                    endpoint = f"/dataservice/device/dpi/applications?deviceId={device_id}"
-                    result = session.get(endpoint, timeout=10)
-                    
-                    if 'data' in result and result['data']:
-                        for app in result['data']:
-                            app_name = app.get('application', 'Unknown')
-                            if app_name not in apps:
-                                apps[app_name] = 0
-                            apps[app_name] += app.get('octets-received', 0) + app.get('octets-sent', 0)
-                except:
-                    continue
-            return apps
-        
-        apps_sitio1 = analizar_sitio(sitio1_devices)
-        apps_sitio2 = analizar_sitio(sitio2_devices)
-        
-        # Comparar
-        comparacion = []
-        todas_apps = set(list(apps_sitio1.keys()) + list(apps_sitio2.keys()))
-        
-        for app in todas_apps:
-            bytes_s1 = apps_sitio1.get(app, 0)
-            bytes_s2 = apps_sitio2.get(app, 0)
-            diferencia = bytes_s1 - bytes_s2
+                formatted_devices.append({
+                    'hostname': device.get('hostname', 'N/A'),
+                    'management_ip': device.get('managementIpAddress', 'N/A'),
+                    'family': device.get('family', 'N/A'),
+                    'type': device.get('type', 'N/A'),
+                    'role': device.get('role', 'N/A'),
+                    'software_version': device.get('softwareVersion', 'N/A'),
+                    'reachability': device.get('reachabilityStatus', 'N/A'),
+                    'series': device.get('series', 'N/A'),
+                    'location': device.get('location', 'N/A'),
+                    'up_time': device.get('upTime', 'N/A')
+                })
             
-            comparacion.append({
-                'aplicacion': app,
-                f'sitio_{site_id_1}_gb': round(bytes_s1 / (1024**3), 2),
-                f'sitio_{site_id_2}_gb': round(bytes_s2 / (1024**3), 2),
-                'diferencia_gb': round(abs(diferencia) / (1024**3), 2),
-                'sitio_mayor_uso': site_id_1 if diferencia > 0 else site_id_2
-            })
+            return f"🌐 DISPOSITIVOS CATALYST CENTER\n\nTotal: {len(formatted_devices)}\n\nDispositivos:\n{formatted_devices}"
         
-        comparacion.sort(key=lambda x: x['diferencia_gb'], reverse=True)
+        return "No se encontraron dispositivos"
         
-        return (
-            f"⚖️  COMPARACIÓN DE TRÁFICO\n\n"
-            f"Sitio {site_id_1}: {len(sitio1_devices)} dispositivos\n"
-            f"Sitio {site_id_2}: {len(sitio2_devices)} dispositivos\n\n"
-            f"Aplicaciones únicas sitio {site_id_1}: {len([a for a in comparacion if a[f'sitio_{site_id_2}_gb'] == 0])}\n"
-            f"Aplicaciones únicas sitio {site_id_2}: {len([a for a in comparacion if a[f'sitio_{site_id_1}_gb'] == 0])}\n"
-            f"Aplicaciones comunes: {len([a for a in comparacion if a[f'sitio_{site_id_1}_gb'] > 0 and a[f'sitio_{site_id_2}_gb'] > 0])}\n\n"
-            f"Top diferencias:\n{comparacion[:15]}"
-        )
-        
+    except ValueError as e:
+        return f"Error de configuración: {str(e)}\n\nAsegúrate de configurar CATALYST_IP, CATALYST_USERNAME y CATALYST_PASSWORD en el archivo .env"
+    except (ConnectionError, TimeoutError) as e:
+        return f"Error de conexión: {str(e)}"
     except Exception as e:
-        return f"Error al comparar sitios: {str(e)}"
+        return f"Error inesperado: {str(e)}"
 
 
 @mcp.tool()
-def detectar_aplicaciones_no_autorizadas(whitelist: str = "") -> str:
+def catalyst_salud_dispositivo(device_id: str) -> str:
     """
-    Detecta aplicaciones que están consumiendo ancho de banda pero no están en la lista autorizada.
-    Útil para compliance y detección de shadow IT.
+    Obtiene el estado de salud de un dispositivo específico en Catalyst Center.
     
     Args:
-        whitelist: Lista de aplicaciones autorizadas separadas por comas (ej: "office-365,zoom,teams,google"). Si se deja vacío muestra todas las aplicaciones.
+        device_id: UUID o IP del dispositivo
     
     Returns:
-        Lista de aplicaciones no autorizadas detectadas en la red con nivel de riesgo y ubicaciones
+        Estado de salud detallado incluyendo score general, memoria, CPU y conectividad
     """
     try:
-        session = get_vmanage_session()
+        session = get_catalyst_session()
         
-        # Convertir whitelist
-        apps_autorizadas = set()
-        if whitelist:
-            apps_autorizadas = set(app.strip().lower() for app in whitelist.split(','))
+        # Obtener health score
+        endpoint_health = f"/dna/intent/api/v1/device-health"
+        result_health = session.get(endpoint_health, timeout=30)
         
-        # Obtener dispositivos
-        devices_result = session.get("/dataservice/device", timeout=20)
-        if 'data' not in devices_result:
-            return "No se pudieron obtener dispositivos"
+        # Buscar el dispositivo específico
+        device_health = None
+        if 'response' in result_health:
+            for dev in result_health['response']:
+                if dev.get('id') == device_id or dev.get('managementIpAddress') == device_id:
+                    device_health = dev
+                    break
         
-        edge_devices = [d for d in devices_result['data'] if d.get('device-type') == 'vedge']
+        if not device_health:
+            return f"⚠️  No se encontró el dispositivo {device_id}"
         
-        # Consolidar aplicaciones no autorizadas
-        apps_no_autorizadas = {}
+        # Formatear resultado
+        resultado = f"💚 SALUD DEL DISPOSITIVO\n"
+        resultado += f"{'='*70}\n\n"
+        resultado += f"Nombre: {device_health.get('name', 'N/A')}\n"
+        resultado += f"IP: {device_health.get('managementIpAddress', 'N/A')}\n"
+        resultado += f"Health Score: {device_health.get('overallHealth', 0)}/10\n\n"
         
-        for device in edge_devices[:30]:  # Limitar a 30
-            device_id = device.get('deviceId') or device.get('uuid')
-            device_name = device.get('host-name')
-            site_id = device.get('site-id')
+        resultado += f"📊 Métricas:\n"
+        resultado += f"  CPU: {device_health.get('cpuScore', 'N/A')}/10\n"
+        resultado += f"  Memoria: {device_health.get('memoryScore', 'N/A')}/10\n"
+        resultado += f"  Interfaces: {device_health.get('interfaceScore', 'N/A')}/10\n"
+        resultado += f"  Issues: {device_health.get('issueCount', 0)}\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"Error al obtener salud del dispositivo: {str(e)}"
+
+
+@mcp.tool()
+def catalyst_topologia_red(topology_type: str = "physical") -> str:
+    """
+    Obtiene la topología de la red desde Catalyst Center.
+    
+    Args:
+        topology_type: Tipo de topología - "physical" o "layer2" o "layer3" (default: "physical")
+    
+    Returns:
+        Información de topología con nodos y enlaces
+    """
+    try:
+        session = get_catalyst_session()
+        endpoint = f"/dna/intent/api/v1/topology/{topology_type}-topology"
+        result = session.get(endpoint, timeout=30)
+        
+        if 'response' in result:
+            topology = result['response']
+            nodes = topology.get('nodes', [])
+            links = topology.get('links', [])
             
-            try:
-                endpoint = f"/dataservice/device/dpi/applications?deviceId={device_id}"
-                result = session.get(endpoint, timeout=10)
+            resultado = f"🗺️  TOPOLOGÍA DE RED ({topology_type.upper()})\n"
+            resultado += f"{'='*70}\n\n"
+            resultado += f"Total de nodos: {len(nodes)}\n"
+            resultado += f"Total de enlaces: {len(links)}\n\n"
+            
+            if nodes:
+                resultado += f"📍 Nodos principales:\n"
+                for i, node in enumerate(nodes[:10], 1):
+                    resultado += f"  {i}. {node.get('label', 'N/A')} ({node.get('nodeType', 'N/A')})\n"
                 
-                if 'data' in result and result['data']:
-                    for app in result['data']:
-                        app_name = app.get('application', 'Unknown')
-                        app_name_lower = app_name.lower()
-                        
-                        # Verificar si está en whitelist
-                        if whitelist and app_name_lower in apps_autorizadas:
-                            continue  # Está autorizada, saltar
-                        
-                        bytes_total = app.get('octets-received', 0) + app.get('octets-sent', 0)
-                        
-                        if app_name not in apps_no_autorizadas:
-                            apps_no_autorizadas[app_name] = {
-                                'bytes_total': 0,
-                                'dispositivos': set(),
-                                'sitios': set(),
-                                'familia': app.get('family', 'Unknown')
-                            }
-                        
-                        apps_no_autorizadas[app_name]['bytes_total'] += bytes_total
-                        apps_no_autorizadas[app_name]['dispositivos'].add(device_name)
-                        apps_no_autorizadas[app_name]['sitios'].add(site_id)
-                        
-            except:
-                continue
+                if len(nodes) > 10:
+                    resultado += f"  ... y {len(nodes) - 10} nodos más\n"
+            
+            return resultado
         
-        # Generar reporte
-        if not apps_no_autorizadas:
-            return "✅ No se detectaron aplicaciones no autorizadas"
-        
-        apps_lista = []
-        for app_name, data in apps_no_autorizadas.items():
-            apps_lista.append({
-                'aplicacion': app_name,
-                'familia': data['familia'],
-                'bytes_gb': round(data['bytes_total'] / (1024**3), 2),
-                'num_dispositivos': len(data['dispositivos']),
-                'num_sitios': len(data['sitios']),
-                'nivel_riesgo': '🔴 Alto' if data['bytes_total'] > 10*(1024**3) else 
-                               '🟡 Medio' if data['bytes_total'] > 1*(1024**3) else '🟢 Bajo'
-            })
-        
-        apps_lista.sort(key=lambda x: x['bytes_gb'], reverse=True)
-        
-        return (
-            f"⚠️  APLICACIONES NO AUTORIZADAS DETECTADAS\n\n"
-            f"{'Whitelist: ' + whitelist if whitelist else 'Sin whitelist definida (mostrando todas)'}\n"
-            f"Aplicaciones detectadas: {len(apps_lista)}\n"
-            f"Tráfico total no autorizado: {sum(a['bytes_gb'] for a in apps_lista):.2f} GB\n\n"
-            f"Detalle:\n{apps_lista[:25]}"
-        )
+        return "No se pudo obtener la topología"
         
     except Exception as e:
-        return f"Error al detectar aplicaciones no autorizadas: {str(e)}"
+        return f"Error al obtener topología: {str(e)}"
 
 
 @mcp.tool()
-def ver_estado_sistema_dispositivo(device_id: str) -> str:
+def catalyst_inventario_sitios() -> str:
     """
-    Obtiene el estado completo del sistema de un dispositivo incluyendo CPU, memoria, disco, uptime y versión de software.
-    
-    Args:
-        device_id: ID del dispositivo (system-ip como 10.95.0.3)
+    Lista todos los sitios configurados en Catalyst Center con su jerarquía.
     
     Returns:
-        Estado detallado del sistema con métricas de recursos y conectividad
+        Estructura jerárquica de sitios (áreas, edificios, pisos)
+    """
+    try:
+        session = get_catalyst_session()
+        endpoint = "/dna/intent/api/v1/site"
+        result = session.get(endpoint, timeout=30)
+        
+        if 'response' in result:
+            sites = result['response']
+            
+            resultado = f"🏢 INVENTARIO DE SITIOS\n"
+            resultado += f"{'='*70}\n\n"
+            resultado += f"Total de sitios: {len(sites)}\n\n"
+            
+            for site in sites:
+                site_info = site.get('additionalInfo', [])
+                site_type = 'N/A'
+                for info in site_info:
+                    if info.get('nameSpace') == 'Location':
+                        attrs = info.get('attributes', {})
+                        site_type = attrs.get('type', 'N/A')
+                        break
+                
+                resultado += f"📍 {site.get('name', 'N/A')}\n"
+                resultado += f"   Tipo: {site_type}\n"
+                resultado += f"   ID: {site.get('id', 'N/A')}\n\n"
+            
+            return resultado
+        
+        return "No se encontraron sitios"
+        
+    except Exception as e:
+        return f"Error al obtener sitios: {str(e)}"
+
+
+@mcp.tool()
+def catalyst_clientes_conectados(limit: int = 100) -> str:
+    """
+    Lista los clientes conectados actualmente a la red.
+    
+    Args:
+        limit: Número máximo de clientes a mostrar (default: 100)
+    
+    Returns:
+        Lista de clientes con información de conectividad y salud
+    """
+    try:
+        session = get_catalyst_session()
+        endpoint = f"/dna/intent/api/v1/client-health?timestamp="
+        result = session.get(endpoint, timeout=30)
+        
+        if 'response' in result:
+            clients_summary = result['response']
+            
+            resultado = f"👥 CLIENTES CONECTADOS\n"
+            resultado += f"{'='*70}\n\n"
+            
+            for score_category in clients_summary:
+                score_type = score_category.get('scoreCategory', {}).get('scoreCategory', 'N/A')
+                client_count = score_category.get('scoreCategory', {}).get('clientCount', 0)
+                
+                resultado += f"Score {score_type}: {client_count} clientes\n"
+            
+            # Obtener detalle de clientes individuales
+            endpoint_detail = f"/dna/intent/api/v1/client-detail?limit={limit}"
+            result_detail = session.get(endpoint_detail, timeout=30)
+            
+            if 'response' in result_detail and result_detail['response']:
+                clients = result_detail['response']
+                resultado += f"\n\n📋 Detalle de clientes (top {min(len(clients), limit)}):\n\n"
+                
+                for i, client in enumerate(clients[:limit], 1):
+                    resultado += f"{i}. {client.get('hostName', 'N/A')}\n"
+                    resultado += f"   MAC: {client.get('hostMac', 'N/A')}\n"
+                    resultado += f"   IP: {client.get('hostIpV4', 'N/A')}\n"
+                    resultado += f"   Conectado a: {client.get('connectedDevice', [{}])[0].get('deviceName', 'N/A')}\n"
+                    resultado += f"   SSID: {client.get('ssid', 'N/A')}\n"
+                    resultado += f"   Health Score: {client.get('healthScore', [{}])[0].get('score', 'N/A')}\n\n"
+            
+            return resultado
+        
+        return "No se pudo obtener información de clientes"
+        
+    except Exception as e:
+        return f"Error al obtener clientes: {str(e)}"
+
+
+@mcp.tool()
+def catalyst_issues_red(severity: str = "HIGH") -> str:
+    """
+    Lista los problemas detectados en la red por Catalyst Center.
+    
+    Args:
+        severity: Nivel de severidad - "HIGH", "MEDIUM", "LOW" (default: "HIGH")
+    
+    Returns:
+        Lista de issues con descripción y dispositivos afectados
+    """
+    try:
+        session = get_catalyst_session()
+        endpoint = f"/dna/intent/api/v1/issues?severity={severity}"
+        result = session.get(endpoint, timeout=30)
+        
+        if 'response' in result:
+            issues = result['response']
+            
+            resultado = f"⚠️  PROBLEMAS DE RED (Severidad: {severity})\n"
+            resultado += f"{'='*70}\n\n"
+            resultado += f"Total de issues: {len(issues)}\n\n"
+            
+            for i, issue in enumerate(issues[:20], 1):
+                resultado += f"{i}. {issue.get('name', 'N/A')}\n"
+                resultado += f"   Categoría: {issue.get('category', 'N/A')}\n"
+                resultado += f"   Severidad: {issue.get('severity', 'N/A')}\n"
+                resultado += f"   Dispositivo: {issue.get('deviceName', 'N/A')}\n"
+                resultado += f"   Última ocurrencia: {issue.get('lastOccurredTime', 'N/A')}\n\n"
+            
+            if len(issues) > 20:
+                resultado += f"... y {len(issues) - 20} issues más\n"
+            
+            return resultado
+        
+        return f"No se encontraron issues con severidad {severity}"
+        
+    except Exception as e:
+        return f"Error al obtener issues: {str(e)}"
+
+
+@mcp.tool()
+def catalyst_resumen_red() -> str:
+    """
+    Obtiene un dashboard general del estado de la red en Catalyst Center.
+    
+    Returns:
+        Resumen con salud general, dispositivos, clientes e issues críticos
+    """
+    try:
+        session = get_catalyst_session()
+        
+        # Obtener salud general
+        endpoint_health = "/dna/intent/api/v1/network-health"
+        health_data = session.get(endpoint_health, timeout=30)
+        
+        # Obtener conteo de dispositivos
+        endpoint_devices = "/dna/intent/api/v1/network-device/count"
+        devices_count = session.get(endpoint_devices, timeout=30)
+        
+        # Obtener issues críticos
+        endpoint_issues = "/dna/intent/api/v1/issues?severity=HIGH"
+        issues = session.get(endpoint_issues, timeout=30)
+        
+        resultado = f"📊 RESUMEN GENERAL - CATALYST CENTER\n"
+        resultado += f"{'='*70}\n\n"
+        
+        # Salud general
+        if 'response' in health_data:
+            health_scores = health_data['response']
+            resultado += f"💚 SALUD DE LA RED:\n"
+            for health in health_scores[:5]:
+                resultado += f"  {health.get('entity', 'N/A')}: {health.get('healthScore', 'N/A')}/10\n"
+            resultado += f"\n"
+        
+        # Dispositivos
+        if 'response' in devices_count:
+            count = devices_count['response']
+            resultado += f"🖥️  DISPOSITIVOS:\n"
+            resultado += f"  Total: {count}\n\n"
+        
+        # Issues críticos
+        if 'response' in issues:
+            issues_list = issues['response']
+            resultado += f"⚠️  ISSUES CRÍTICOS: {len(issues_list)}\n"
+        
+        resultado += f"\n{'='*70}\n"
+        resultado += f"✅ Sistema operativo y monitoreando\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"Error al obtener resumen de red: {str(e)}"
+
+
+
+@mcp.tool()
+def obtener_flujos_dpi_sitio(sitio: str, aplicacion: str = "") -> str:
+    """
+    Obtiene información de flujos DPI de un sitio específico usando vManage API.
+    Muestra dispositivos del sitio y sus aplicaciones detectadas por DPI.
+    
+    Args:
+        sitio: Nombre del sitio, ID del sitio, o hostname del dispositivo (ej: "SITE_100", "100", "SDWAN-CJF-323-RT01")
+        aplicacion: (Opcional) Filtrar por aplicación específica (ej: "adobe-services", "ssl")
+    
+    Returns:
+        Dispositivos del sitio con aplicaciones DPI y estadísticas de uso
+        
+    Nota: Para IPs origen→destino específicas, usa vManage GUI:
+          Monitor → Applications → DPI Flows → Filter por sitio → Export
     """
     try:
         session = get_vmanage_session()
-        endpoint = f"/dataservice/device/system/status?deviceId={device_id}"
-        result = session.get(endpoint, timeout=15)
         
-        if 'data' in result and result['data']:
-            data = result['data'][0] if isinstance(result['data'], list) else result['data']
-            
-            # Convertir uptime a formato legible
-            uptime_seconds = data.get('uptime-date', 0)
-            dias = uptime_seconds // 86400
-            horas = (uptime_seconds % 86400) // 3600
-            minutos = (uptime_seconds % 3600) // 60
-            
-            return (
-                f"💻 ESTADO DEL SISTEMA - {device_id}\n\n"
-                f"Hostname: {data.get('vdevice-host-name', 'N/A')}\n"
-                f"Modelo: {data.get('vdevice-model', 'N/A')}\n"
-                f"Versión: {data.get('version', 'N/A')}\n"
-                f"Estado: {data.get('state', 'N/A')}\n"
-                f"Site ID: {data.get('site-id', 'N/A')}\n\n"
-                f"📊 Recursos:\n"
-                f"  CPU: {data.get('cpu-load', 0)}%\n"
-                f"  Memoria usada: {data.get('mem-used', 0)}%\n"
-                f"  Disco usado: {data.get('disk-used', 0)}%\n\n"
-                f"⏱️  Uptime: {dias} días, {horas} horas, {minutos} minutos\n\n"
-                f"📡 Conectividad:\n"
-                f"  Última actualización: {data.get('lastupdated', 'N/A')}\n"
-                f"  Modo reachability: {data.get('reachability', 'N/A')}\n"
-            )
+        # Buscar dispositivos del sitio
+        dispositivos = session.get_json(f"{session.base_url}/dataservice/device")
         
-        return f"No se pudo obtener estado del dispositivo {device_id}"
+        # Filtrar dispositivos por sitio
+        devices_encontrados = []
+        for dev in dispositivos.get('data', []):
+            site_id = dev.get('site-id', '')
+            hostname = dev.get('host-name', '')
+            
+            # Buscar por site_id, nombre de sitio en hostname, o hostname exacto
+            if (str(site_id) == sitio or 
+                sitio.upper() in hostname.upper() or
+                sitio.lower() in hostname.lower()):
+                devices_encontrados.append(dev)
+        
+        if not devices_encontrados:
+            return f"❌ No se encontraron dispositivos para el sitio '{sitio}'.\n\nVerifica el nombre del sitio o ID."
+        
+        # Obtener estadísticas DPI de cada dispositivo
+        resultado = f"🔍 FLUJOS DPI - {sitio.upper()}\n"
+        resultado += f"{'='*80}\n\n"
+        resultado += f"📊 Dispositivos encontrados: {len(devices_encontrados)}\n\n"
+        
+        for i, dev in enumerate(devices_encontrados, 1):
+            device_id = dev.get('deviceId', dev.get('system-ip', ''))
+            hostname = dev.get('host-name', 'Unknown')
+            site_id = dev.get('site-id', 'N/A')
+            device_model = dev.get('device-model', 'N/A')
+            reachability = dev.get('reachability', 'unknown')
+            
+            # Indicador de estado
+            estado_icon = "🟢" if reachability == "reachable" else "🔴"
+            
+            resultado += f"{i}. {hostname} {estado_icon}\n"
+            resultado += f"   Site ID: {site_id} | Modelo: {device_model}\n"
+            resultado += f"   System IP: {device_id}\n"
+            
+            if reachability != "reachable":
+                resultado += f"   ⚠️  Dispositivo no alcanzable\n\n"
+                continue
+            
+            # Obtener aplicaciones DPI del dispositivo
+            try:
+                # Endpoint de estadísticas DPI por dispositivo
+                dpi_url = f"{session.base_url}/dataservice/statistics/dpi/device/{device_id}"
+                dpi_response = session.get_json(dpi_url, timeout=15)
+                
+                apps_dpi = dpi_response.get('data', [])
+                
+                if apps_dpi:
+                    # Filtrar por aplicación si se especifica
+                    if aplicacion:
+                        apps_dpi = [a for a in apps_dpi 
+                                   if aplicacion.lower() in a.get('application', '').lower()]
+                    
+                    if apps_dpi:
+                        # Ordenar por uso
+                        apps_dpi.sort(key=lambda x: x.get('octets', 0), reverse=True)
+                        
+                        resultado += f"   \n   📱 Top aplicaciones DPI ({len(apps_dpi)} total):\n"
+                        
+                        for j, app in enumerate(apps_dpi[:10], 1):
+                            app_name = app.get('application', 'unknown')
+                            octets = app.get('octets', 0)
+                            usage_mb = octets / (1024**2)
+                            
+                            resultado += f"      {j:2}. {app_name:30} - {usage_mb:8.2f} MB\n"
+                        
+                        if len(apps_dpi) > 10:
+                            resultado += f"      ... y {len(apps_dpi) - 10} aplicaciones más\n"
+                    else:
+                        resultado += f"   ℹ️  No hay tráfico de '{aplicacion}' en este dispositivo\n"
+                else:
+                    resultado += f"   ℹ️  Sin datos DPI disponibles para este dispositivo\n"
+                    
+            except Exception as e:
+                resultado += f"   ⚠️  Error al obtener DPI: {str(e)}\n"
+            
+            resultado += "\n"
+        
+        resultado += f"{'='*80}\n"
+        resultado += f"💡 NOTAS:\n"
+        resultado += f"   • Esta información viene de vManage API en tiempo real\n"
+        resultado += f"   • Para ver IPs origen→destino específicas:\n"
+        resultado += f"     1. Abre vManage GUI\n"
+        resultado += f"     2. Monitor → Applications → DPI Flows\n"
+        resultado += f"     3. Filtra por Site ID: {devices_encontrados[0].get('site-id', 'N/A')}\n"
+        resultado += f"     4. Export → verás IPs origen, destino, puertos, etc.\n"
+        
+        return resultado
         
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"❌ Error al obtener flujos DPI: {str(e)}\n\nVerifica:\n1. Conexión con vManage\n2. Nombre del sitio correcto\n3. DPI habilitado en el sitio"
+
+
+@mcp.tool()
+def ver_metricas_dispositivos_sdwan() -> str:
+    """
+    Obtiene métricas de todos los dispositivos SD-WAN desde vManage.
+    Muestra información de conectividad, control, y estabilidad de cada dispositivo.
+    
+    Útil para:
+    - Ver estado de conexiones vSmart de todos los dispositivos
+    - Identificar dispositivos con reinicios o crashes
+    - Verificar conectividad de control plane
+    - Auditoría de estabilidad de la red SD-WAN
+    
+    Returns:
+        Tabla con métricas de dispositivos: System IP, conexiones vSmart, 
+        conexiones esperadas, número de reinicios y crashes
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo métricas de dispositivos SD-WAN...", file=sys.stderr)
+        
+        vmanage = VManageSession(
+            os.getenv("VMANAGE_IP"),
+            os.getenv("VMANAGE_USERNAME"),
+            os.getenv("VMANAGE_PASSWORD")
+        )
+        
+        if not vmanage.login():
+            return "❌ Error de autenticación con vManage"
+        
+        # Obtener lista de dispositivos (endpoint principal)
+        response = vmanage.get("/dataservice/device")
+        
+        if not response or 'data' not in response:
+            return "❌ No se pudieron obtener métricas de dispositivos"
+        
+        devices_data = response['data']
+        
+        print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Métricas obtenidas: {len(devices_data)} dispositivos", file=sys.stderr)
+        
+        resultado = f"📊 MÉTRICAS DE DISPOSITIVOS SD-WAN\n"
+        resultado += f"{'='*100}\n\n"
+        resultado += f"Total de dispositivos: {len(devices_data)}\n"
+        resultado += f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        
+        # Tabla de métricas
+        resultado += f"{'Hostname':<30} {'System IP':<16} {'Site ID':<10} {'Estado':<15} {'Reachability':<15} {'Modelo':<20}\n"
+        resultado += f"{'-'*120}\n"
+        
+        # Contadores para estadísticas
+        devices_reachable = 0
+        devices_unreachable = 0
+        devices_up = 0
+        devices_down = 0
+        sites_dict = {}
+        
+        for device in sorted(devices_data, key=lambda x: x.get('host-name', '')):
+            hostname = device.get('host-name', 'Unknown')
+            system_ip = device.get('system-ip', 'N/A')
+            site_id = device.get('site-id', 'N/A')
+            reachability = device.get('reachability', 'unknown')
+            status = device.get('status', 'unknown')
+            model = device.get('device-model', 'N/A')
+            
+            # Estadísticas
+            if reachability == 'reachable':
+                devices_reachable += 1
+            else:
+                devices_unreachable += 1
+            
+            if status == 'normal':
+                devices_up += 1
+            else:
+                devices_down += 1
+            
+            # Contar sitios únicos
+            if site_id != 'N/A':
+                sites_dict[site_id] = sites_dict.get(site_id, 0) + 1
+            
+            # Indicador de estado
+            if reachability == 'reachable' and status == 'normal':
+                status_icon = "✅"
+            elif reachability == 'reachable':
+                status_icon = "⚠️ "
+            else:
+                status_icon = "🔴"
+            
+            # Formatear valores
+            reach_display = "🟢 Reachable" if reachability == 'reachable' else "🔴 Unreachable"
+            status_display = "🟢 Normal" if status == 'normal' else f"⚠️  {status}"
+            
+            resultado += f"{status_icon} {hostname:<28} {system_ip:<16} {site_id:<10} {status_display:<15} {reach_display:<15} {model:<20}\n"
+        
+        # Resumen estadístico
+        resultado += f"\n{'='*120}\n"
+        resultado += f"📈 RESUMEN ESTADÍSTICO:\n\n"
+        resultado += f"  🌐 Total de dispositivos:             {len(devices_data)}\n"
+        resultado += f"  🏢 Total de sitios:                   {len(sites_dict)}\n"
+        resultado += f"  ✅ Dispositivos alcanzables:          {devices_reachable}\n"
+        resultado += f"  🔴 Dispositivos NO alcanzables:       {devices_unreachable}\n"
+        resultado += f"  🟢 Dispositivos con estado normal:    {devices_up}\n"
+        resultado += f"  ⚠️  Dispositivos con problemas:        {devices_down}\n"
+        
+        resultado += f"\n{'='*120}\n"
+        resultado += f"💡 INTERPRETACIÓN:\n"
+        resultado += f"  • Reachability: Indica si vManage puede contactar el dispositivo\n"
+        resultado += f"  • Estado: Estado operativo del dispositivo (normal, warning, down, etc.)\n"
+        resultado += f"  • Site ID: Identificador del sitio al que pertenece el dispositivo\n"
+        resultado += f"\n  ✅ = Dispositivo operativo y alcanzable\n"
+        resultado += f"  ⚠️  = Dispositivo alcanzable pero con advertencias\n"
+        resultado += f"  🔴 = Dispositivo NO alcanzable o fuera de servicio\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener métricas de dispositivos: {str(e)}"
+
+
+@mcp.tool()
+def ver_estadisticas_interfaces(identificador: str, top_interfaces: int = 20) -> str:
+    """
+    Obtiene estadísticas detalladas de todas las interfaces de un dispositivo.
+    Muestra tráfico, errores, estado administrativo/operativo, y métricas de rendimiento.
+    
+    Args:
+        identificador: Hostname, System IP, o ID del dispositivo (ej: "SDWAN-CJF-318-RT01", "10.95.11.3")
+        top_interfaces: Número de interfaces con más tráfico a destacar (default: 20)
+    
+    Returns:
+        Estadísticas detalladas de interfaces:
+        - Estado administrativo y operativo
+        - Velocidad, MTU, direcciones IP/MAC
+        - Tráfico Rx/Tx (kbps, packets, octets)
+        - Errores y descartes
+        - Top interfaces por tráfico
+    
+    Útil para:
+    - Diagnosticar problemas de conectividad
+    - Identificar interfaces con errores
+    - Analizar patrones de tráfico
+    - Verificar configuración de interfaces
+    - Troubleshooting de rendimiento
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo estadísticas de interfaces para: {identificador}", file=sys.stderr)
+        
+        vmanage = VManageSession(
+            os.getenv("VMANAGE_IP"),
+            os.getenv("VMANAGE_USERNAME"),
+            os.getenv("VMANAGE_PASSWORD")
+        )
+        
+        if not vmanage.login():
+            return "❌ Error de autenticación con vManage"
+        
+        # Buscar dispositivo
+        devices_response = vmanage.get("/dataservice/device")
+        if not devices_response or 'data' not in devices_response:
+            return "❌ No se pudo obtener lista de dispositivos"
+        
+        devices = devices_response['data']
+        
+        # Buscar por hostname, system-ip o device-id
+        device_found = None
+        for dev in devices:
+            if (identificador.lower() in dev.get('host-name', '').lower() or
+                identificador == dev.get('system-ip', '') or
+                identificador == dev.get('uuid', '')):
+                device_found = dev
+                break
+        
+        if not device_found:
+            return (f"❌ Dispositivo '{identificador}' no encontrado\n\n"
+                   f"Verifica el identificador. Puede ser:\n"
+                   f"  • Hostname (ej: SDWAN-CJF-318-RT01)\n"
+                   f"  • System IP (ej: 10.95.11.3)\n"
+                   f"  • Device UUID")
+        
+        device_id = device_found.get('deviceId') or device_found.get('uuid')
+        hostname = device_found.get('host-name', 'Unknown')
+        system_ip = device_found.get('system-ip', 'N/A')
+        site_id = device_found.get('site-id', 'N/A')
+        
+        print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Dispositivo encontrado: {hostname} ({system_ip})", file=sys.stderr)
+        
+        # Obtener estadísticas de interfaces
+        response = vmanage.get(f"/dataservice/device/counters?deviceId={device_id}")
+        
+        if not response or 'data' not in response:
+            return f"❌ No se pudieron obtener estadísticas de interfaces para {hostname}"
+        
+        interfaces = response['data']
+        
+        print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Estadísticas obtenidas: {len(interfaces)} interfaces", file=sys.stderr)
+        
+        resultado = f"🌐 ESTADÍSTICAS DE INTERFACES - {hostname}\n"
+        resultado += f"{'='*120}\n\n"
+        resultado += f"Dispositivo:  {hostname}\n"
+        resultado += f"System IP:    {system_ip}\n"
+        resultado += f"Site ID:      {site_id}\n"
+        resultado += f"Device ID:    {device_id}\n"
+        resultado += f"Interfaces:   {len(interfaces)}\n"
+        resultado += f"Actualizado:  {datetime.fromtimestamp(response.get('header', {}).get('generatedOn', 0) / 1000).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        
+        # Clasificar interfaces
+        interfaces_up = []
+        interfaces_down = []
+        interfaces_with_traffic = []
+        interfaces_with_errors = []
+        
+        for iface in interfaces:
+            if_oper_status = iface.get('if-oper-status', '')
+            rx_octets = iface.get('rx-octets', 0)
+            tx_octets = iface.get('tx-octets', 0)
+            rx_errors = iface.get('rx-errors', 0) + iface.get('rx-drops', 0)
+            tx_errors = iface.get('tx-errors', 0) + iface.get('tx-drops', 0)
+            
+            total_traffic = rx_octets + tx_octets
+            total_errors = rx_errors + tx_errors
+            
+            if 'ready' in if_oper_status.lower():
+                interfaces_up.append(iface)
+            else:
+                interfaces_down.append(iface)
+            
+            if total_traffic > 0:
+                iface['_total_traffic'] = total_traffic
+                interfaces_with_traffic.append(iface)
+            
+            if total_errors > 0:
+                iface['_total_errors'] = total_errors
+                interfaces_with_errors.append(iface)
+        
+        # Resumen
+        resultado += f"{'='*120}\n"
+        resultado += f"📊 RESUMEN DE ESTADO:\n\n"
+        resultado += f"  🟢 Interfaces UP (operativas):     {len(interfaces_up)}\n"
+        resultado += f"  🔴 Interfaces DOWN:                {len(interfaces_down)}\n"
+        resultado += f"  📈 Interfaces con tráfico:         {len(interfaces_with_traffic)}\n"
+        resultado += f"  ⚠️  Interfaces con errores/drops:  {len(interfaces_with_errors)}\n\n"
+        
+        # Top interfaces por tráfico
+        if interfaces_with_traffic:
+            interfaces_with_traffic.sort(key=lambda x: x.get('_total_traffic', 0), reverse=True)
+            
+            resultado += f"{'='*120}\n"
+            resultado += f"🔝 TOP {min(top_interfaces, len(interfaces_with_traffic))} INTERFACES POR TRÁFICO:\n\n"
+            resultado += f"{'Interface':<20} {'VPN':<5} {'Admin':<8} {'Oper':<8} {'Rx (GB)':<12} {'Tx (GB)':<12} {'Errores':<10} {'IP Address':<18}\n"
+            resultado += f"{'-'*120}\n"
+            
+            for iface in interfaces_with_traffic[:top_interfaces]:
+                ifname = iface.get('ifname', 'N/A')
+                vpn = iface.get('vpn-id', 'N/A')
+                admin_status = '🟢 UP' if 'up' in iface.get('if-admin-status', '').lower() else '🔴 DOWN'
+                oper_status = '🟢 UP' if 'ready' in iface.get('if-oper-status', '').lower() else '🔴 DOWN'
+                rx_gb = iface.get('rx-octets', 0) / (1024**3)
+                tx_gb = iface.get('tx-octets', 0) / (1024**3)
+                errors = iface.get('_total_errors', 0)
+                ip_addr = iface.get('ip-address', 'N/A')
+                
+                error_icon = '⚠️ ' if errors > 0 else '  '
+                
+                resultado += f"{error_icon}{ifname:<18} {vpn:<5} {admin_status:<8} {oper_status:<8} {rx_gb:>10.2f}  {tx_gb:>10.2f}  {errors:<10} {ip_addr:<18}\n"
+        
+        # Interfaces con errores
+        if interfaces_with_errors:
+            interfaces_with_errors.sort(key=lambda x: x.get('_total_errors', 0), reverse=True)
+            
+            resultado += f"\n{'='*120}\n"
+            resultado += f"⚠️  INTERFACES CON ERRORES/DESCARTES:\n\n"
+            resultado += f"{'Interface':<20} {'VPN':<5} {'Rx Errors':<12} {'Rx Drops':<12} {'Tx Errors':<12} {'Tx Drops':<12} {'Total':<10}\n"
+            resultado += f"{'-'*120}\n"
+            
+            for iface in interfaces_with_errors[:20]:  # Máximo 20 interfaces con errores
+                ifname = iface.get('ifname', 'N/A')
+                vpn = iface.get('vpn-id', 'N/A')
+                rx_errors = iface.get('rx-errors', 0)
+                rx_drops = iface.get('rx-drops', 0)
+                tx_errors = iface.get('tx-errors', 0)
+                tx_drops = iface.get('tx-drops', 0)
+                total_errors = iface.get('_total_errors', 0)
+                
+                resultado += f"{'⚠️ '}{ifname:<18} {vpn:<5} {rx_errors:<12} {rx_drops:<12} {tx_errors:<12} {tx_drops:<12} {total_errors:<10}\n"
+        
+        # Interfaces Down
+        if interfaces_down:
+            resultado += f"\n{'='*120}\n"
+            resultado += f"🔴 INTERFACES DOWN (No operativas):\n\n"
+            resultado += f"{'Interface':<20} {'VPN':<5} {'Admin Status':<15} {'Oper Status':<20} {'IP Address':<18}\n"
+            resultado += f"{'-'*120}\n"
+            
+            for iface in interfaces_down[:30]:  # Máximo 30 interfaces down
+                ifname = iface.get('ifname', 'N/A')
+                vpn = iface.get('vpn-id', 'N/A')
+                admin_status = iface.get('if-admin-status', 'N/A')
+                oper_status = iface.get('if-oper-status', 'N/A')
+                ip_addr = iface.get('ip-address', 'N/A')
+                
+                resultado += f"  {ifname:<18} {vpn:<5} {admin_status:<15} {oper_status:<20} {ip_addr:<18}\n"
+        
+        # Estadísticas totales
+        total_rx_gb = sum(iface.get('rx-octets', 0) for iface in interfaces) / (1024**3)
+        total_tx_gb = sum(iface.get('tx-octets', 0) for iface in interfaces) / (1024**3)
+        total_rx_errors = sum(iface.get('rx-errors', 0) + iface.get('rx-drops', 0) for iface in interfaces)
+        total_tx_errors = sum(iface.get('tx-errors', 0) + iface.get('tx-drops', 0) for iface in interfaces)
+        
+        resultado += f"\n{'='*120}\n"
+        resultado += f"📈 ESTADÍSTICAS TOTALES DEL DISPOSITIVO:\n\n"
+        resultado += f"  📥 Total recibido (Rx):       {total_rx_gb:>10.2f} GB\n"
+        resultado += f"  📤 Total transmitido (Tx):    {total_tx_gb:>10.2f} GB\n"
+        resultado += f"  📊 Total tráfico:             {(total_rx_gb + total_tx_gb):>10.2f} GB\n"
+        resultado += f"  ⚠️  Total errores Rx:          {total_rx_errors:>10,}\n"
+        resultado += f"  ⚠️  Total errores Tx:          {total_tx_errors:>10,}\n"
+        
+        resultado += f"\n{'='*120}\n"
+        resultado += f"💡 NOTAS:\n"
+        resultado += f"  • Admin Status: Estado configurado (UP/DOWN)\n"
+        resultado += f"  • Oper Status: Estado operativo real\n"
+        resultado += f"  • Errores incluyen: rx-errors + rx-drops + tx-errors + tx-drops\n"
+        resultado += f"  • Para ver detalles específicos de una interfaz en vManage:\n"
+        resultado += f"    Monitor → Network → {hostname} → Interface\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener estadísticas de interfaces: {str(e)}"
 
 
 if __name__ == "__main__":
-    # Ejecutar el servidor MCP
-    mcp.run()
+    """
+    Punto de entrada principal del servidor MCP.
+    Primero actualiza las cookies y luego inicia el servidor.
+    """
+    print(f"\n🚀 INICIANDO SERVIDOR MCP - CISCO SD-WAN MANAGER", file=sys.stderr)
+    print(f"⏰ Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n", file=sys.stderr)
+    
+    # Iniciar el servidor MCP
+    print(f"🎯 Iniciando servidor MCP...\n", file=sys.stderr)
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        print(f"\n\n⏹️  Servidor detenido por el usuario", file=sys.stderr)
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n\n❌ Error al ejecutar el servidor: {str(e)}", file=sys.stderr)
+        sys.exit(1)

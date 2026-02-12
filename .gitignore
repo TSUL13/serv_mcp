@@ -41,3 +41,27 @@ wheels/
 Thumbs.db
 venvsource/
 .analytics_cookies.json
+
+# API validation artifacts (contienen cookies/tokens)
+*.har
+analytics_traffic.har
+validacion_api_*.json
+analytics_api_capturada.py
+actualizar_api.py
+
+# Backups de .env
+.env.backup.*
+
+# Archivos obsoletos
+*.obsoleto
+
+# Backups de server
+server.py.backup_*
+server_temp.py
+
+# Archivos temporales de OS
+os/
+time/
+
+# Browser cookie3 local
+browser_cookie3/
