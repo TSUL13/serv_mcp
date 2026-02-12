@@ -2508,6 +2508,264 @@ def catalyst_resumen_red() -> str:
         return f"Error al obtener resumen de red: {str(e)}"
 
 
+@mcp.tool()
+def top_sitios_saturados(
+    top: int = 20,
+    max_dispositivos: int = 50,
+    todos: bool = False,
+    umbral_pct: float = 0.0
+) -> str:
+    """
+    Identifica los sitios SD-WAN más saturados consultando las interfaces de los dispositivos en tiempo real.
+    Calcula el porcentaje de utilización de cada enlace WAN (VPN 0) comparando el tráfico actual (kbps) 
+    contra la velocidad del enlace (speed-mbps).
+    
+    Args:
+        top: Número de sitios más saturados a mostrar (default: 20)
+        max_dispositivos: Número máximo de dispositivos a consultar para agilizar (default: 50, máximo recomendado: 100)
+        todos: Si True, consulta TODOS los dispositivos (~325). LENTO: puede tardar 4-5 minutos (default: False)
+        umbral_pct: Solo mostrar interfaces con utilización mayor a este porcentaje (default: 0.0)
+    
+    Returns:
+        Ranking de sitios por saturación con detalle de interfaces, tráfico y % de utilización
+    
+    Ejemplo:
+        top_sitios_saturados() - Top 20 sitios más saturados (muestreo rápido de 50 dispositivos)
+        top_sitios_saturados(todos=True) - Analizar TODOS los dispositivos (~4 min)
+        top_sitios_saturados(top=10, umbral_pct=10) - Solo sitios con más de 10% de utilización
+    """
+    try:
+        import time as time_mod
+        start_time = time_mod.time()
+        
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Analizando saturación de sitios...", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Obtener WAN edges alcanzables
+        devices_result = session.get("/dataservice/device")
+        all_devices = devices_result.get('data', [])
+        
+        vedges = [d for d in all_devices 
+                  if d.get('device-type') == 'vedge' and d.get('reachability') == 'reachable']
+        
+        if not vedges:
+            return "❌ No se encontraron dispositivos WAN Edge alcanzables"
+        
+        # Determinar cuántos consultar
+        if todos:
+            devices_to_query = vedges
+        else:
+            devices_to_query = vedges[:max_dispositivos]
+        
+        total_to_query = len(devices_to_query)
+        
+        resultado = f"📊 ANÁLISIS DE SATURACIÓN DE SITIOS SD-WAN\n"
+        resultado += f"{'='*110}\n\n"
+        resultado += f"🔎 Modo: {'COMPLETO (todos los dispositivos)' if todos else f'Muestreo ({total_to_query} de {len(vedges)} dispositivos)'}\n"
+        resultado += f"📡 WAN Edges alcanzables: {len(vedges)}\n"
+        resultado += f"🕐 Análisis en tiempo real...\n\n"
+        
+        # Consultar interfaces de cada dispositivo
+        sitios = {}
+        errores = 0
+        consultados = 0
+        
+        for dev in devices_to_query:
+            dev_id = dev.get('deviceId') or dev.get('system-ip', '')
+            hostname = dev.get('host-name', '')
+            site_id = str(dev.get('site-id', 'N/A'))
+            
+            try:
+                resp = session.get(f"/dataservice/device/interface?deviceId={dev_id}", timeout=10)
+                ifaces = resp.get('data', [])
+                
+                for iface in ifaces:
+                    vpn = iface.get('vpn-id')
+                    oper_status = iface.get('if-oper-status', '')
+                    ifname = iface.get('ifname', '')
+                    
+                    if str(vpn) != '0' or 'ready' not in oper_status.lower():
+                        continue
+                    
+                    if ifname.lower().startswith(('loopback', 'system', 'sdwan_')):
+                        continue
+                    
+                    rx_kbps = int(iface.get('rx-kbps', 0) or 0)
+                    tx_kbps = int(iface.get('tx-kbps', 0) or 0)
+                    speed_mbps = iface.get('speed-mbps', 0)
+                    rx_octets = int(iface.get('rx-octets', 0) or 0)
+                    tx_octets = int(iface.get('tx-octets', 0) or 0)
+                    
+                    utilization = 0.0
+                    if speed_mbps and speed_mbps != 'N/A':
+                        speed_kbps = int(speed_mbps) * 1000
+                        if speed_kbps > 0:
+                            utilization = ((rx_kbps + tx_kbps) / speed_kbps) * 100
+                    
+                    if utilization < umbral_pct and rx_kbps + tx_kbps == 0:
+                        continue
+                    
+                    if site_id not in sitios:
+                        sitios[site_id] = {
+                            'interfaces': [],
+                            'hostnames': set(),
+                            'max_util': 0.0,
+                            'total_rx_kbps': 0,
+                            'total_tx_kbps': 0,
+                            'total_rx_gb': 0.0,
+                            'total_tx_gb': 0.0
+                        }
+                    
+                    sitios[site_id]['hostnames'].add(hostname)
+                    sitios[site_id]['total_rx_kbps'] += rx_kbps
+                    sitios[site_id]['total_tx_kbps'] += tx_kbps
+                    sitios[site_id]['total_rx_gb'] += rx_octets / (1024**3)
+                    sitios[site_id]['total_tx_gb'] += tx_octets / (1024**3)
+                    
+                    if utilization > sitios[site_id]['max_util']:
+                        sitios[site_id]['max_util'] = utilization
+                    
+                    sitios[site_id]['interfaces'].append({
+                        'hostname': hostname,
+                        'ifname': ifname,
+                        'rx_kbps': rx_kbps,
+                        'tx_kbps': tx_kbps,
+                        'speed_mbps': speed_mbps,
+                        'utilization': utilization,
+                        'rx_gb': rx_octets / (1024**3),
+                        'tx_gb': tx_octets / (1024**3),
+                        'description': iface.get('description', '')
+                    })
+                
+                consultados += 1
+                if consultados % 20 == 0:
+                    print(f"   ... {consultados}/{total_to_query} dispositivos consultados", file=sys.stderr)
+                    
+            except Exception as e:
+                errores += 1
+                print(f"   ⚠️ Error en {hostname}: {str(e)[:50]}", file=sys.stderr)
+        
+        elapsed = time_mod.time() - start_time
+        
+        if not sitios:
+            return f"❌ No se encontraron interfaces con datos de tráfico\n\nTiempo: {elapsed:.1f}s | Dispositivos consultados: {consultados} | Errores: {errores}"
+        
+        def fmt_kbps(kbps):
+            if kbps > 1000000:
+                return f"{kbps / 1000000:.1f} Gbps"
+            if kbps > 1000:
+                return f"{kbps / 1000:.1f} Mbps"
+            return f"{kbps} kbps"
+        
+        def fmt_gb(gb):
+            if gb > 1024:
+                return f"{gb / 1024:.1f} TB"
+            return f"{gb:.1f} GB"
+        
+        sorted_sites = sorted(sitios.items(), key=lambda x: x[1]['max_util'], reverse=True)
+        
+        if umbral_pct > 0:
+            sorted_sites = [(s, d) for s, d in sorted_sites if d['max_util'] >= umbral_pct]
+        
+        resultado += f"⏱️  Tiempo de análisis: {elapsed:.1f}s\n"
+        resultado += f"✅ Dispositivos consultados: {consultados}\n"
+        if errores > 0:
+            resultado += f"⚠️  Errores: {errores}\n"
+        resultado += f"🏢 Sitios con tráfico: {len(sitios)}\n\n"
+        
+        # === RANKING DE SITIOS ===
+        resultado += f"{'='*110}\n"
+        resultado += f"🔝 TOP {min(top, len(sorted_sites))} SITIOS MÁS SATURADOS:\n\n"
+        resultado += f"{'#':<4} {'SITIO':<10} {'MAX %':<8} {'TRÁFICO ACTUAL':<22} {'ACUMULADO':<22} {'DISPOSITIVOS':<30} {'IFACES':<8}\n"
+        resultado += f"{'-'*110}\n"
+        
+        for i, (site_id, data) in enumerate(sorted_sites[:top], 1):
+            total_actual = data['total_rx_kbps'] + data['total_tx_kbps']
+            total_acum = data['total_rx_gb'] + data['total_tx_gb']
+            max_util = data['max_util']
+            hostnames = ', '.join(sorted(data['hostnames']))[:28]
+            num_ifaces = len(data['interfaces'])
+            
+            if max_util >= 80:
+                icon = "🔴"
+            elif max_util >= 50:
+                icon = "🟠"
+            elif max_util >= 20:
+                icon = "🟡"
+            else:
+                icon = "🟢"
+            
+            resultado += f"{i:<4} {site_id:<10} {icon}{max_util:>5.1f}% {fmt_kbps(total_actual):<22} {fmt_gb(total_acum):<22} {hostnames:<30} {num_ifaces:<8}\n"
+        
+        # === DETALLE DE INTERFACES MÁS SATURADAS ===
+        all_interfaces = []
+        for site_id, data in sitios.items():
+            for iface in data['interfaces']:
+                iface['site_id'] = site_id
+                all_interfaces.append(iface)
+        
+        all_interfaces.sort(key=lambda x: x['utilization'], reverse=True)
+        top_ifaces = [i for i in all_interfaces if i['utilization'] >= max(umbral_pct, 1.0)][:25]
+        
+        if top_ifaces:
+            resultado += f"\n{'='*110}\n"
+            resultado += f"🔌 TOP {len(top_ifaces)} INTERFACES MÁS SATURADAS:\n\n"
+            resultado += f"{'#':<4} {'SITIO':<10} {'DISPOSITIVO':<25} {'INTERFAZ':<22} {'RX':<12} {'TX':<12} {'SPEED':<10} {'% USO':<8}\n"
+            resultado += f"{'-'*110}\n"
+            
+            for j, iface in enumerate(top_ifaces, 1):
+                util = iface['utilization']
+                if util >= 80:
+                    icon = "🔴"
+                elif util >= 50:
+                    icon = "🟠"
+                elif util >= 20:
+                    icon = "🟡"
+                else:
+                    icon = "🟢"
+                
+                speed_str = f"{iface['speed_mbps']} Mbps" if iface['speed_mbps'] != 'N/A' else 'N/A'
+                resultado += f"{j:<4} {iface['site_id']:<10} {iface['hostname']:<25} {iface['ifname']:<22} {fmt_kbps(iface['rx_kbps']):<12} {fmt_kbps(iface['tx_kbps']):<12} {speed_str:<10} {icon}{util:>5.1f}%\n"
+                
+                if iface.get('description'):
+                    resultado += f"{'':4} {'':10} └─ {iface['description']}\n"
+        
+        # === ESTADÍSTICAS GLOBALES ===
+        total_rx_global = sum(d['total_rx_kbps'] for d in sitios.values())
+        total_tx_global = sum(d['total_tx_kbps'] for d in sitios.values())
+        total_rx_gb_global = sum(d['total_rx_gb'] for d in sitios.values())
+        total_tx_gb_global = sum(d['total_tx_gb'] for d in sitios.values())
+        sitios_criticos = sum(1 for _, d in sorted_sites if d['max_util'] >= 80)
+        sitios_altos = sum(1 for _, d in sorted_sites if 50 <= d['max_util'] < 80)
+        sitios_medios = sum(1 for _, d in sorted_sites if 20 <= d['max_util'] < 50)
+        sitios_bajos = sum(1 for _, d in sorted_sites if d['max_util'] < 20)
+        
+        resultado += f"\n{'='*110}\n"
+        resultado += f"📈 ESTADÍSTICAS GLOBALES DE LA RED:\n\n"
+        resultado += f"  📥 Tráfico Rx actual:    {fmt_kbps(total_rx_global)}\n"
+        resultado += f"  📤 Tráfico Tx actual:    {fmt_kbps(total_tx_global)}\n"
+        resultado += f"  📊 Tráfico total actual: {fmt_kbps(total_rx_global + total_tx_global)}\n"
+        resultado += f"  💾 Acumulado Rx:         {fmt_gb(total_rx_gb_global)}\n"
+        resultado += f"  💾 Acumulado Tx:         {fmt_gb(total_tx_gb_global)}\n\n"
+        resultado += f"  🔴 Sitios críticos (≥80%):  {sitios_criticos}\n"
+        resultado += f"  🟠 Sitios altos (50-80%):   {sitios_altos}\n"
+        resultado += f"  🟡 Sitios medios (20-50%):  {sitios_medios}\n"
+        resultado += f"  🟢 Sitios bajos (<20%):     {sitios_bajos}\n"
+        
+        if not todos and len(vedges) > max_dispositivos:
+            resultado += f"\n⚠️  NOTA: Solo se consultaron {consultados} de {len(vedges)} dispositivos.\n"
+            resultado += f"   Para un análisis completo usa: top_sitios_saturados(todos=True)\n"
+            resultado += f"   Esto tardará aproximadamente {len(vedges) * 0.8:.0f} segundos.\n"
+        
+        resultado += f"\n💡 Leyenda: 🔴 ≥80% | 🟠 50-80% | 🟡 20-50% | 🟢 <20%\n"
+        resultado += f"💡 % USO = (Rx + Tx kbps) / (Speed kbps) × 100 — interfaces VPN 0 (transporte)\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al analizar saturación: {str(e)}"
+
 
 @mcp.tool()
 def obtener_flujos_dpi_sitio(sitio: str, aplicacion: str = "") -> str:
@@ -2529,7 +2787,7 @@ def obtener_flujos_dpi_sitio(sitio: str, aplicacion: str = "") -> str:
         session = get_vmanage_session()
         
         # Buscar dispositivos del sitio
-        dispositivos = session.get_json(f"{session.base_url}/dataservice/device")
+        dispositivos = session.get("/dataservice/device")
         
         # Filtrar dispositivos por sitio
         devices_encontrados = []
@@ -2546,10 +2804,15 @@ def obtener_flujos_dpi_sitio(sitio: str, aplicacion: str = "") -> str:
         if not devices_encontrados:
             return f"❌ No se encontraron dispositivos para el sitio '{sitio}'.\n\nVerifica el nombre del sitio o ID."
         
+        # Obtener TODOS los flujos DPI una sola vez
+        all_dpi = session.get("/dataservice/statistics/dpi", timeout=60)
+        all_flows = all_dpi.get('data', [])
+        
         # Obtener estadísticas DPI de cada dispositivo
         resultado = f"🔍 FLUJOS DPI - {sitio.upper()}\n"
         resultado += f"{'='*80}\n\n"
-        resultado += f"📊 Dispositivos encontrados: {len(devices_encontrados)}\n\n"
+        resultado += f"📊 Dispositivos encontrados: {len(devices_encontrados)}\n"
+        resultado += f"📡 Flujos DPI totales en red: {len(all_flows)}\n\n"
         
         for i, dev in enumerate(devices_encontrados, 1):
             device_id = dev.get('deviceId', dev.get('system-ip', ''))
@@ -2569,39 +2832,54 @@ def obtener_flujos_dpi_sitio(sitio: str, aplicacion: str = "") -> str:
                 resultado += f"   ⚠️  Dispositivo no alcanzable\n\n"
                 continue
             
-            # Obtener aplicaciones DPI del dispositivo
+            # Filtrar flujos DPI de este dispositivo
             try:
-                # Endpoint de estadísticas DPI por dispositivo
-                dpi_url = f"{session.base_url}/dataservice/statistics/dpi/device/{device_id}"
-                dpi_response = session.get_json(dpi_url, timeout=15)
+                device_flows = [f for f in all_flows 
+                               if f.get('host_name', '') == hostname or 
+                                  f.get('vdevice_name', '') == device_id]
                 
-                apps_dpi = dpi_response.get('data', [])
+                # Filtrar por aplicación si se especifica
+                if aplicacion:
+                    device_flows = [f for f in device_flows 
+                                   if aplicacion.lower() in f.get('application', '').lower()]
                 
-                if apps_dpi:
-                    # Filtrar por aplicación si se especifica
-                    if aplicacion:
-                        apps_dpi = [a for a in apps_dpi 
-                                   if aplicacion.lower() in a.get('application', '').lower()]
+                if device_flows:
+                    # Agregar por aplicación
+                    apps_agg = {}
+                    for flow in device_flows:
+                        app_name = flow.get('application', 'unknown')
+                        octets = int(flow.get('octets', 0))
+                        if app_name not in apps_agg:
+                            apps_agg[app_name] = {'bytes': 0, 'flujos': 0}
+                        apps_agg[app_name]['bytes'] += octets
+                        apps_agg[app_name]['flujos'] += 1
                     
-                    if apps_dpi:
-                        # Ordenar por uso
-                        apps_dpi.sort(key=lambda x: x.get('octets', 0), reverse=True)
-                        
-                        resultado += f"   \n   📱 Top aplicaciones DPI ({len(apps_dpi)} total):\n"
-                        
-                        for j, app in enumerate(apps_dpi[:10], 1):
-                            app_name = app.get('application', 'unknown')
-                            octets = app.get('octets', 0)
-                            usage_mb = octets / (1024**2)
-                            
-                            resultado += f"      {j:2}. {app_name:30} - {usage_mb:8.2f} MB\n"
-                        
-                        if len(apps_dpi) > 10:
-                            resultado += f"      ... y {len(apps_dpi) - 10} aplicaciones más\n"
-                    else:
-                        resultado += f"   ℹ️  No hay tráfico de '{aplicacion}' en este dispositivo\n"
+                    # Ordenar por bytes
+                    sorted_apps = sorted(apps_agg.items(), key=lambda x: x[1]['bytes'], reverse=True)
+                    
+                    total_bytes = sum(a[1]['bytes'] for a in sorted_apps)
+                    
+                    def fmt_bytes(b):
+                        if b > 1024**3: return f"{b / (1024**3):.2f} GB"
+                        if b > 1024**2: return f"{b / (1024**2):.2f} MB"
+                        if b > 1024: return f"{b / 1024:.1f} KB"
+                        return f"{b} B"
+                    
+                    resultado += f"\n   📱 Top aplicaciones DPI ({len(sorted_apps)} apps, {len(device_flows)} flujos, {fmt_bytes(total_bytes)} total):\n"
+                    resultado += f"   {'#':<5} {'APLICACIÓN':<30} {'TRÁFICO':<12} {'%':<7} {'FLUJOS':<8}\n"
+                    resultado += f"   {'-'*65}\n"
+                    
+                    for j, (app_name, data) in enumerate(sorted_apps[:15], 1):
+                        pct = (data['bytes'] / total_bytes * 100) if total_bytes > 0 else 0
+                        resultado += f"   {j:<5} {app_name:<30} {fmt_bytes(data['bytes']):<12} {pct:>5.1f}% {data['flujos']:<8}\n"
+                    
+                    if len(sorted_apps) > 15:
+                        resultado += f"   ... y {len(sorted_apps) - 15} aplicaciones más\n"
                 else:
-                    resultado += f"   ℹ️  Sin datos DPI disponibles para este dispositivo\n"
+                    if aplicacion:
+                        resultado += f"   ℹ️  No hay tráfico de '{aplicacion}' en este dispositivo\n"
+                    else:
+                        resultado += f"   ℹ️  Sin flujos DPI activos para este dispositivo\n"
                     
             except Exception as e:
                 resultado += f"   ⚠️  Error al obtener DPI: {str(e)}\n"
