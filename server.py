@@ -3083,8 +3083,36 @@ def ver_aplicaciones_sitio(
         apps = resp_apps.get('data', [])
         
         if not apps:
-            return (f"{resultado}❌ No hay datos DPI disponibles para este sitio.\n\n"
-                    f"Verifica que DPI esté habilitado en los dispositivos del sitio.")
+            # Diagnóstico: verificar estado DPI de los dispositivos
+            dpi_status = []
+            for dev in site_devices:
+                dev_ip = dev.get('system-ip', '')
+                dev_name = dev.get('host-name', '')
+                try:
+                    dpi_sum = session.get(f"/dataservice/device/dpi/summary?deviceId={dev_ip}", timeout=10)
+                    dpi_data = dpi_sum.get('data', [])
+                    if dpi_data:
+                        d = dpi_data[0]
+                        dpi_status.append(f"  • {dev_name}: DPI {d.get('status','?')} | flujos activos: {d.get('current-flows',0)} | peak: {d.get('peak-flows',0)}")
+                    else:
+                        dpi_status.append(f"  • {dev_name}: Sin información DPI")
+                except:
+                    dpi_status.append(f"  • {dev_name}: No se pudo consultar DPI")
+            
+            resultado += f"❌ No se encontraron datos de aplicaciones DPI para este sitio.\n\n"
+            resultado += f"📋 ESTADO DPI DE LOS DISPOSITIVOS:\n"
+            resultado += '\n'.join(dpi_status) + '\n\n'
+            resultado += f"📌 DIAGNÓSTICO:\n"
+            resultado += f"  DPI puede estar habilitado pero no clasificando tráfico.\n"
+            resultado += f"  Esto ocurre cuando:\n"
+            resultado += f"  1. No hay una Data Policy que active la inspección DPI\n"
+            resultado += f"  2. Falta licencia App-Aware/APPX en los dispositivos\n"
+            resultado += f"  3. La política DPI no está aplicada al sitio\n\n"
+            resultado += f"💡 HERRAMIENTAS ALTERNATIVAS DISPONIBLES:\n"
+            resultado += f"  • ver_saturacion_sitio('{site_ids[0]}') — Ver tráfico real por interfaz WAN\n"
+            resultado += f"  • ver_estadisticas_interfaces('{hostnames[0]}') — Estadísticas detalladas de interfaces\n"
+            resultado += f"  • ver_salud_equipo('{system_ips[0]}') — Salud general del dispositivo\n"
+            return resultado
         
         # Si se filtra por familia, obtener el mapeo app->familia
         app_familia = {}
@@ -3662,6 +3690,694 @@ def ver_estadisticas_interfaces(identificador: str, top_interfaces: int = 20) ->
         
     except Exception as e:
         return f"❌ Error al obtener estadísticas de interfaces: {str(e)}"
+
+
+# =====================================================
+# HERRAMIENTA 31: VER CALIDAD SAAS POR SITIO (CloudX)
+# =====================================================
+@mcp.tool()
+def ver_calidad_saas_sitios(
+    top: int = 30,
+    sitio: str = "",
+    aplicacion: str = ""
+) -> str:
+    """
+    Muestra la calidad de aplicaciones SaaS (Office 365, Webex, etc.) por sitio,
+    usando datos Cloud Express (CloudX) de vManage — la misma información que se ve en Analytics.
+    Incluye Score VQE (Video Quality Experience), latencia, pérdida y mejor camino.
+    
+    Args:
+        top: Número de sitios a mostrar en el ranking (default: 30)
+        sitio: (Opcional) Filtrar por sitio específico (ej: "51660", "660")
+        aplicacion: (Opcional) Filtrar por aplicación (ej: "office365", "webex")
+    
+    Returns:
+        Ranking de sitios por calidad SaaS con scores VQE, latencia y pérdida.
+        Incluye resumen por aplicación y detección de sitios con problemas.
+    
+    Ejemplo:
+        ver_calidad_saas_sitios() - Todos los sitios, ranking por peor calidad
+        ver_calidad_saas_sitios(sitio="660") - Calidad SaaS de un sitio específico
+        ver_calidad_saas_sitios(aplicacion="office365") - Solo Office 365
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo calidad SaaS (CloudX)...", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Obtener datos CloudX (hasta 10000 registros)
+        cloudx_result = session.get("/dataservice/statistics/cloudx?count=10000", timeout=60)
+        cloudx_data = cloudx_result.get('data', [])
+        
+        if not cloudx_data:
+            return ("❌ No hay datos de Cloud Express (CloudX) disponibles.\n\n"
+                    "Esto puede ocurrir si:\n"
+                    "  1. Cloud OnRamp/Cloud Express no está habilitado\n"
+                    "  2. No hay aplicaciones SaaS siendo monitoreadas\n"
+                    "  3. Las políticas de Cloud Express no están desplegadas")
+        
+        # Filtrar por sitio si se especificó
+        if sitio:
+            sitio_lower = sitio.strip().lower()
+            cloudx_data = [item for item in cloudx_data
+                           if sitio_lower in str(item.get('site_id', '')).lower()
+                           or sitio_lower in item.get('host_name', '').lower()]
+            if not cloudx_data:
+                return f"❌ No se encontraron datos CloudX para el sitio '{sitio}'."
+        
+        # Filtrar por aplicación si se especificó
+        if aplicacion:
+            app_lower = aplicacion.strip().lower()
+            cloudx_data = [item for item in cloudx_data
+                           if app_lower in item.get('application', '').lower()
+                           or app_lower in item.get('nbar_app_group_name', '').lower()]
+            if not cloudx_data:
+                return f"❌ No se encontraron datos CloudX para la aplicación '{aplicacion}'."
+        
+        def fmt_score(score):
+            """Formatea el score VQE con icono de calidad."""
+            try:
+                s = float(score)
+            except (ValueError, TypeError):
+                return "  -  "
+            if s >= 8: return f"🟢 {s:.1f}"
+            if s >= 5: return f"🟡 {s:.1f}"
+            if s >= 3: return f"🟠 {s:.1f}"
+            return f"🔴 {s:.1f}"
+        
+        # ===== ANÁLISIS POR SITIO =====
+        from collections import defaultdict
+        site_stats = defaultdict(lambda: {
+            'total_score': 0.0, 'total_latency': 0.0, 'total_loss': 0.0,
+            'count': 0, 'best_paths': 0, 'hostname': '', 'apps': set()
+        })
+        
+        for item in cloudx_data:
+            sid = str(item.get('site_id', '?'))
+            try:
+                site_stats[sid]['total_score'] += float(item.get('vqe_score', 0))
+                site_stats[sid]['total_latency'] += float(item.get('latency', 0))
+                site_stats[sid]['total_loss'] += float(item.get('loss', 0))
+            except (ValueError, TypeError):
+                pass
+            site_stats[sid]['count'] += 1
+            if item.get('best_path') == 'TRUE':
+                site_stats[sid]['best_paths'] += 1
+            site_stats[sid]['hostname'] = item.get('host_name', '')
+            site_stats[sid]['apps'].add(item.get('application', ''))
+        
+        # Ordenar por peor score (ascendente)
+        sites_ranked = sorted(site_stats.items(),
+                              key=lambda x: x[1]['total_score'] / max(x[1]['count'], 1))
+        
+        total_sites = len(sites_ranked)
+        
+        # ===== ANÁLISIS POR APLICACIÓN =====
+        app_stats = defaultdict(lambda: {
+            'total_score': 0.0, 'total_latency': 0.0, 'total_loss': 0.0,
+            'count': 0, 'best_paths': 0, 'group': ''
+        })
+        
+        for item in cloudx_data:
+            app = item.get('application', '?')
+            try:
+                app_stats[app]['total_score'] += float(item.get('vqe_score', 0))
+                app_stats[app]['total_latency'] += float(item.get('latency', 0))
+                app_stats[app]['total_loss'] += float(item.get('loss', 0))
+            except (ValueError, TypeError):
+                pass
+            app_stats[app]['count'] += 1
+            if item.get('best_path') == 'TRUE':
+                app_stats[app]['best_paths'] += 1
+            app_stats[app]['group'] = item.get('nbar_app_group_name', '')
+        
+        # ===== CONSTRUIR RESULTADO =====
+        resultado = f"🌐 CALIDAD DE APLICACIONES SaaS (Cloud Express)\n"
+        resultado += f"{'='*130}\n\n"
+        resultado += f"📊 Registros analizados: {len(cloudx_data):,}\n"
+        resultado += f"📡 Sitios con datos: {total_sites}\n"
+        resultado += f"📱 Aplicaciones monitoreadas: {len(app_stats)}\n"
+        if sitio:
+            resultado += f"🔎 Filtro sitio: '{sitio}'\n"
+        if aplicacion:
+            resultado += f"🔎 Filtro aplicación: '{aplicacion}'\n"
+        
+        # Detectar sitios con problemas
+        problem_sites = [s for s, stats in sites_ranked
+                         if stats['total_score'] / max(stats['count'], 1) < 5.0]
+        if problem_sites:
+            resultado += f"\n⚠️  SITIOS CON CALIDAD DEFICIENTE (VQE < 5.0): {len(problem_sites)}\n"
+        
+        # Tabla de sitios
+        resultado += f"\n{'='*130}\n"
+        resultado += f"📋 RANKING DE SITIOS (ordenado por peor calidad):\n\n"
+        resultado += f"{'#':<4} {'SITIO':<10} {'DISPOSITIVO':<35} {'VQE SCORE':<12} {'LATENCIA':<14} {'PÉRDIDA':<10} {'APPS':<6} {'MUESTRAS':<10}\n"
+        resultado += f"{'-'*105}\n"
+        
+        for i, (sid, stats) in enumerate(sites_ranked[:top], 1):
+            n = max(stats['count'], 1)
+            avg_score = stats['total_score'] / n
+            avg_lat = stats['total_latency'] / n
+            avg_loss = stats['total_loss'] / n
+            
+            resultado += (f"{i:<4} {sid:<10} {stats['hostname']:<35} "
+                         f"{fmt_score(avg_score):<12} {avg_lat:>8.1f} ms   "
+                         f"{avg_loss:>5.1f}%    {len(stats['apps']):<6} {stats['count']:<10}\n")
+        
+        if len(sites_ranked) > top:
+            resultado += f"\n     ... y {len(sites_ranked) - top} sitios más\n"
+        
+        # Tabla de aplicaciones
+        apps_ranked = sorted(app_stats.items(),
+                             key=lambda x: x[1]['total_score'] / max(x[1]['count'], 1))
+        
+        resultado += f"\n{'='*130}\n"
+        resultado += f"📱 CALIDAD POR APLICACIÓN:\n\n"
+        resultado += f"{'#':<4} {'APLICACIÓN':<45} {'GRUPO':<20} {'VQE SCORE':<12} {'LATENCIA':<14} {'PÉRDIDA':<10} {'BEST PATH':<10}\n"
+        resultado += f"{'-'*120}\n"
+        
+        for i, (app, stats) in enumerate(apps_ranked, 1):
+            n = max(stats['count'], 1)
+            avg_score = stats['total_score'] / n
+            avg_lat = stats['total_latency'] / n
+            avg_loss = stats['total_loss'] / n
+            bp_pct = (stats['best_paths'] / n * 100) if n > 0 else 0
+            
+            resultado += (f"{i:<4} {app:<45} {stats['group']:<20} "
+                         f"{fmt_score(avg_score):<12} {avg_lat:>8.1f} ms   "
+                         f"{avg_loss:>5.1f}%    {bp_pct:>5.1f}%\n")
+        
+        # Detalle de sitio específico
+        if sitio and len(sites_ranked) <= 5:
+            resultado += f"\n{'='*130}\n"
+            resultado += f"📋 DETALLE POR APLICACIÓN EN EL SITIO:\n\n"
+            
+            site_app_detail = defaultdict(lambda: {
+                'total_score': 0.0, 'total_latency': 0.0, 'total_loss': 0.0,
+                'count': 0, 'best_path_iface': '', 'exit_type': ''
+            })
+            
+            for item in cloudx_data:
+                app = item.get('application', '?')
+                try:
+                    site_app_detail[app]['total_score'] += float(item.get('vqe_score', 0))
+                    site_app_detail[app]['total_latency'] += float(item.get('latency', 0))
+                    site_app_detail[app]['total_loss'] += float(item.get('loss', 0))
+                except (ValueError, TypeError):
+                    pass
+                site_app_detail[app]['count'] += 1
+                if item.get('best_path') == 'TRUE':
+                    site_app_detail[app]['best_path_iface'] = item.get('interface', '')
+                    site_app_detail[app]['exit_type'] = item.get('exit_type', '')
+            
+            resultado += f"{'APLICACIÓN':<45} {'VQE':<10} {'LATENCIA':<14} {'PÉRDIDA':<10} {'BEST PATH':<20} {'SALIDA':<10}\n"
+            resultado += f"{'-'*110}\n"
+            
+            for app, stats in sorted(site_app_detail.items(),
+                                      key=lambda x: x[1]['total_score'] / max(x[1]['count'], 1)):
+                n = max(stats['count'], 1)
+                avg_score = stats['total_score'] / n
+                avg_lat = stats['total_latency'] / n
+                avg_loss = stats['total_loss'] / n
+                resultado += (f"{app:<45} {fmt_score(avg_score):<10} {avg_lat:>8.1f} ms   "
+                             f"{avg_loss:>5.1f}%    {stats['best_path_iface']:<20} {stats['exit_type']:<10}\n")
+        
+        resultado += f"\n{'='*130}\n"
+        resultado += f"💡 NOTAS:\n"
+        resultado += f"  • VQE Score: 0-10 (10=excelente, <5=problemas)\n"
+        resultado += f"  • 🟢 ≥8 (bueno) | 🟡 5-7 (aceptable) | 🟠 3-4 (degradado) | 🔴 <3 (crítico)\n"
+        resultado += f"  • Datos de Cloud Express — mismas métricas que Analytics\n"
+        resultado += f"  • Best Path: interfaz con mejor calidad seleccionada por SD-WAN\n\n"
+        resultado += f"💡 HERRAMIENTAS RELACIONADAS:\n"
+        resultado += f"  • ver_calidad_saas_sitios(sitio='51660') — Detalle de un sitio\n"
+        resultado += f"  • ver_calidad_saas_sitios(aplicacion='office365') — Solo Office 365\n"
+        resultado += f"  • ver_saturacion_sitio('660') — Saturación de enlaces del sitio\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener calidad SaaS: {str(e)}"
+
+
+# =====================================================
+# HERRAMIENTA 32: VER DROPS QoS POR SITIO
+# =====================================================
+@mcp.tool()
+def ver_drops_qos(
+    top: int = 30,
+    sitio: str = "",
+    queue: str = ""
+) -> str:
+    """
+    Muestra los drops de QoS (Quality of Service) por dispositivo y cola de prioridad.
+    Detecta sitios con congestión real donde se están descartando paquetes.
+    Usa las mismas estadísticas que Analytics para detectar degradación de servicio.
+    
+    Args:
+        top: Número de dispositivos a mostrar en el ranking (default: 30)
+        sitio: (Opcional) Filtrar por sitio o hostname (ej: "944", "SDWAN-CJF-407-RT01")
+        queue: (Opcional) Filtrar por cola específica (ej: "Queue0", "Queue2")
+    
+    Returns:
+        Ranking de dispositivos con más drops QoS, detalle por cola, y detección de congestión.
+    
+    Ejemplo:
+        ver_drops_qos() - Todos los dispositivos, ranking por más drops
+        ver_drops_qos(sitio="944") - Drops QoS de un sitio específico
+        ver_drops_qos(queue="Queue0") - Solo cola de prioridad (voz/video)
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo estadísticas QoS...", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Obtener datos QoS (hasta 10000 registros)
+        qos_result = session.get("/dataservice/statistics/qos?count=10000", timeout=60)
+        qos_data = qos_result.get('data', [])
+        
+        if not qos_data:
+            return ("❌ No hay datos de QoS disponibles.\n\n"
+                    "Esto puede ocurrir si:\n"
+                    "  1. No hay políticas QoS aplicadas\n"
+                    "  2. Los dispositivos no reportan estadísticas QoS\n"
+                    "  3. Problema de conexión con vManage")
+        
+        # Filtrar por sitio si se especificó
+        if sitio:
+            sitio_lower = sitio.strip().lower()
+            qos_data = [item for item in qos_data
+                        if sitio_lower in item.get('host_name', '').lower()
+                        or sitio_lower in str(item.get('vdevice_name', '')).lower()]
+            if not qos_data:
+                return f"❌ No se encontraron datos QoS para el sitio '{sitio}'."
+        
+        # Filtrar por queue si se especificó
+        if queue:
+            queue_lower = queue.strip().lower()
+            qos_data = [item for item in qos_data
+                        if queue_lower in item.get('queue_name', '').lower()]
+            if not qos_data:
+                return f"❌ No se encontraron datos QoS para la cola '{queue}'."
+        
+        def fmt_bytes(b):
+            if b > 1024**4: return f"{b / (1024**4):.1f} TB"
+            if b > 1024**3: return f"{b / (1024**3):.1f} GB"
+            if b > 1024**2: return f"{b / (1024**2):.1f} MB"
+            if b > 1024: return f"{b / 1024:.1f} KB"
+            return f"{b} B"
+        
+        from collections import defaultdict
+        
+        # ===== ANÁLISIS POR QUEUE (global) =====
+        queue_totals = defaultdict(lambda: {'tx_bytes': 0, 'drop_bytes': 0, 'drop_pkts': 0, 'count': 0})
+        
+        for item in qos_data:
+            q = item.get('queue_name', '?')
+            if q == 'Aggregate':
+                continue  # Saltar el agregado
+            queue_totals[q]['tx_bytes'] += int(item.get('tx_bytes', 0))
+            queue_totals[q]['drop_bytes'] += int(item.get('drop_in_bytes', 0))
+            queue_totals[q]['drop_pkts'] += int(item.get('drop_in_pkts', 0))
+            queue_totals[q]['count'] += 1
+        
+        # ===== ANÁLISIS POR DISPOSITIVO =====
+        dev_stats = defaultdict(lambda: {
+            'tx_bytes': 0, 'drop_bytes': 0, 'drop_pkts': 0,
+            'hostname': '', 'interface': '', 'queues': defaultdict(lambda: {'tx': 0, 'drop': 0, 'drop_pkts': 0})
+        })
+        
+        for item in qos_data:
+            q = item.get('queue_name', '?')
+            if q == 'Aggregate':
+                continue
+            dev_ip = item.get('vdevice_name', '?')
+            dev_stats[dev_ip]['tx_bytes'] += int(item.get('tx_bytes', 0))
+            dev_stats[dev_ip]['drop_bytes'] += int(item.get('drop_in_bytes', 0))
+            dev_stats[dev_ip]['drop_pkts'] += int(item.get('drop_in_pkts', 0))
+            dev_stats[dev_ip]['hostname'] = item.get('host_name', '')
+            dev_stats[dev_ip]['interface'] = item.get('interface', '')
+            dev_stats[dev_ip]['queues'][q]['tx'] += int(item.get('tx_bytes', 0))
+            dev_stats[dev_ip]['queues'][q]['drop'] += int(item.get('drop_in_bytes', 0))
+            dev_stats[dev_ip]['queues'][q]['drop_pkts'] += int(item.get('drop_in_pkts', 0))
+        
+        # Ordenar por más drops
+        devs_ranked = sorted(dev_stats.items(),
+                             key=lambda x: x[1]['drop_bytes'], reverse=True)
+        
+        total_devs = len(devs_ranked)
+        total_drops = sum(s['drop_bytes'] for _, s in devs_ranked)
+        total_tx = sum(s['tx_bytes'] for _, s in devs_ranked)
+        
+        # ===== CONSTRUIR RESULTADO =====
+        resultado = f"📊 DROPS DE QoS POR DISPOSITIVO\n"
+        resultado += f"{'='*130}\n\n"
+        resultado += f"📦 Registros analizados: {len(qos_data):,}\n"
+        resultado += f"📡 Dispositivos: {total_devs}\n"
+        resultado += f"📈 Tráfico total: {fmt_bytes(total_tx)} | Drops totales: {fmt_bytes(total_drops)}"
+        if total_tx > 0:
+            resultado += f" ({total_drops/total_tx*100:.3f}%)"
+        resultado += "\n"
+        if sitio:
+            resultado += f"🔎 Filtro sitio: '{sitio}'\n"
+        if queue:
+            resultado += f"🔎 Filtro cola: '{queue}'\n"
+        
+        # Detectar congestión severa
+        congested = [(dev, s) for dev, s in devs_ranked
+                     if s['tx_bytes'] > 0 and s['drop_bytes'] / s['tx_bytes'] > 0.01]
+        if congested:
+            resultado += f"\n🚨 DISPOSITIVOS CON CONGESTIÓN (>1% drops): {len(congested)}\n"
+            for dev, s in congested:
+                pct = s['drop_bytes'] / s['tx_bytes'] * 100
+                resultado += f"   ⚠️  {s['hostname']}: {pct:.2f}% drops ({fmt_bytes(s['drop_bytes'])})\n"
+        
+        # Tabla resumen por queue
+        resultado += f"\n{'='*130}\n"
+        resultado += f"📋 RESUMEN POR COLA DE PRIORIDAD:\n\n"
+        resultado += f"{'COLA':<15} {'TX TOTAL':<15} {'DROPS':<15} {'DROP PKTS':<15} {'%DROP':<10} {'PRIORIDAD':<30}\n"
+        resultado += f"{'-'*100}\n"
+        
+        queue_names_info = {
+            'Queue0': 'Realtime (Voz/Video)',
+            'Queue1': 'Interactive (Señalización)',
+            'Queue2': 'Default (Datos)',
+            'Queue3': 'Bulk (Transferencia)',
+            'Queue4': 'Best Effort',
+            'Queue5': 'Control/Management',
+            'Queue6': 'Scavenger',
+            'Queue7': 'Network Control'
+        }
+        
+        for q, stats in sorted(queue_totals.items()):
+            pct = (stats['drop_bytes'] / stats['tx_bytes'] * 100) if stats['tx_bytes'] > 0 else 0
+            icon = "🔴" if pct > 0.5 else "🟠" if pct > 0.1 else "🟡" if pct > 0 else "🟢"
+            info = queue_names_info.get(q, '')
+            resultado += (f"{icon} {q:<13} {fmt_bytes(stats['tx_bytes']):<15} "
+                         f"{fmt_bytes(stats['drop_bytes']):<15} {stats['drop_pkts']:>12,}   "
+                         f"{pct:>6.3f}%   {info}\n")
+        
+        # Ranking de dispositivos
+        resultado += f"\n{'='*130}\n"
+        resultado += f"📋 RANKING DE DISPOSITIVOS (por más drops):\n\n"
+        resultado += f"{'#':<4} {'DISPOSITIVO':<35} {'INTERFAZ':<25} {'TX':<15} {'DROPS':<15} {'DROP PKTS':<12} {'%DROP':<8}\n"
+        resultado += f"{'-'*120}\n"
+        
+        for i, (dev_ip, stats) in enumerate(devs_ranked[:top], 1):
+            pct = (stats['drop_bytes'] / stats['tx_bytes'] * 100) if stats['tx_bytes'] > 0 else 0
+            icon = "🔴" if pct > 1 else "🟠" if pct > 0.1 else "🟡" if pct > 0 else "🟢"
+            
+            resultado += (f"{i:<4} {icon} {stats['hostname']:<33} {stats['interface']:<25} "
+                         f"{fmt_bytes(stats['tx_bytes']):<15} {fmt_bytes(stats['drop_bytes']):<15} "
+                         f"{stats['drop_pkts']:>10,}   {pct:>5.2f}%\n")
+            
+            # Si se filtra por sitio, mostrar detalle por queue
+            if sitio and stats['drop_bytes'] > 0:
+                for q, qs in sorted(stats['queues'].items()):
+                    if qs['drop'] > 0:
+                        q_pct = (qs['drop'] / qs['tx'] * 100) if qs['tx'] > 0 else 0
+                        q_info = queue_names_info.get(q, '')
+                        resultado += (f"     └─ {q} ({q_info}): "
+                                     f"TX={fmt_bytes(qs['tx'])}, "
+                                     f"Drops={fmt_bytes(qs['drop'])} ({q_pct:.2f}%), "
+                                     f"{qs['drop_pkts']:,} pkts\n")
+        
+        if len(devs_ranked) > top:
+            resultado += f"\n     ... y {len(devs_ranked) - top} dispositivos más\n"
+        
+        resultado += f"\n{'='*130}\n"
+        resultado += f"💡 NOTAS:\n"
+        resultado += f"  • Queue0 = tráfico de voz/video (prioritario) — drops aquí = problemas de calidad\n"
+        resultado += f"  • Queue2 = tráfico de datos (default) — drops normales bajo congestión\n"
+        resultado += f"  • >1% drops = congestión severa | >0.1% = congestión moderada\n"
+        resultado += f"  • Datos de estadísticas QoS de vManage — misma fuente que Analytics\n\n"
+        resultado += f"💡 HERRAMIENTAS RELACIONADAS:\n"
+        resultado += f"  • ver_drops_qos(sitio='944') — Detalle de drops de un sitio\n"
+        resultado += f"  • ver_drops_qos(queue='Queue0') — Solo cola de voz/video\n"
+        resultado += f"  • ver_saturacion_sitio('944') — Saturación de enlaces del sitio\n"
+        resultado += f"  • ver_calidad_saas_sitios() — Calidad de aplicaciones SaaS\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener drops QoS: {str(e)}"
+
+
+# =====================================================
+# HERRAMIENTA 33: VER SLA DE TÚNELES (Approute)
+# =====================================================
+@mcp.tool()
+def ver_sla_tuneles(
+    top: int = 30,
+    sitio: str = "",
+    color: str = ""
+) -> str:
+    """
+    Muestra el SLA (Service Level Agreement) de los túneles SD-WAN: latencia, jitter y pérdida de paquetes.
+    Usa estadísticas Approute de vManage para mostrar la calidad de cada enlace por color
+    (MPLS/private1, Internet/gold, silver, etc.) — mismos datos que Analytics.
+    
+    Args:
+        top: Número de túneles o dispositivos a mostrar (default: 30)
+        sitio: (Opcional) Filtrar por sitio o hostname (ej: "720", "SDWAN-CJF-720-RT01")
+        color: (Opcional) Filtrar por color de enlace (ej: "gold", "private1", "silver")
+    
+    Returns:
+        Ranking de túneles por peor SLA con latencia, jitter, pérdida y score VQoE.
+        Incluye resumen por tipo de enlace (color) y detección de túneles degradados.
+    
+    Ejemplo:
+        ver_sla_tuneles() - Todos los túneles, ranking por peor SLA
+        ver_sla_tuneles(sitio="720") - SLA de túneles de un sitio
+        ver_sla_tuneles(color="gold") - Solo túneles por Internet
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo SLA de túneles (Approute)...", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Obtener datos Approute (hasta 10000 registros)
+        approute_result = session.get("/dataservice/statistics/approute?count=10000", timeout=60)
+        approute_data = approute_result.get('data', [])
+        
+        if not approute_data:
+            return ("❌ No hay datos de Approute disponibles.\n\n"
+                    "Esto puede ocurrir si:\n"
+                    "  1. Los túneles SD-WAN no están activos\n"
+                    "  2. BFD/Approute no está habilitado\n"
+                    "  3. Problema de conexión con vManage")
+        
+        # Filtrar por sitio si se especificó
+        if sitio:
+            sitio_lower = sitio.strip().lower()
+            approute_data = [item for item in approute_data
+                            if sitio_lower in item.get('host_name', '').lower()
+                            or sitio_lower in str(item.get('siteid', '')).lower()
+                            or sitio_lower in str(item.get('vdevice_name', '')).lower()]
+            if not approute_data:
+                return f"❌ No se encontraron datos Approute para el sitio '{sitio}'."
+        
+        # Filtrar por color si se especificó
+        if color:
+            color_lower = color.strip().lower()
+            approute_data = [item for item in approute_data
+                            if color_lower in item.get('local_color', '').lower()
+                            or color_lower in item.get('remote_color', '').lower()
+                            or color_lower in item.get('tunnel_color', '').lower()]
+            if not approute_data:
+                return f"❌ No se encontraron datos Approute para el color '{color}'."
+        
+        from collections import defaultdict
+        
+        # ===== ANÁLISIS POR COLOR DE ENLACE =====
+        color_stats = defaultdict(lambda: {
+            'total_lat': 0.0, 'total_jit': 0.0, 'total_loss': 0.0,
+            'total_score': 0.0, 'count': 0
+        })
+        
+        for item in approute_data:
+            tc = item.get('tunnel_color', '?')
+            try:
+                color_stats[tc]['total_lat'] += float(item.get('latency', 0))
+                color_stats[tc]['total_jit'] += float(item.get('jitter', 0))
+                color_stats[tc]['total_loss'] += float(item.get('loss_percentage', 0))
+                color_stats[tc]['total_score'] += float(item.get('vqoe_score', 0))
+            except (ValueError, TypeError):
+                pass
+            color_stats[tc]['count'] += 1
+        
+        # ===== ANÁLISIS POR DISPOSITIVO =====
+        dev_stats = defaultdict(lambda: {
+            'total_lat': 0.0, 'total_jit': 0.0, 'total_loss': 0.0,
+            'total_score': 0.0, 'count': 0, 'hostname': '', 'site_id': '',
+            'tunnels': defaultdict(lambda: {
+                'total_lat': 0.0, 'total_jit': 0.0, 'total_loss': 0.0,
+                'total_score': 0.0, 'count': 0, 'state': '', 'sla_names': ''
+            })
+        })
+        
+        for item in approute_data:
+            dev_ip = item.get('vdevice_name', '?')
+            tc = item.get('tunnel_color', '?')
+            try:
+                lat = float(item.get('latency', 0))
+                jit = float(item.get('jitter', 0))
+                loss = float(item.get('loss_percentage', 0))
+                score = float(item.get('vqoe_score', 0))
+            except (ValueError, TypeError):
+                continue
+            
+            dev_stats[dev_ip]['total_lat'] += lat
+            dev_stats[dev_ip]['total_jit'] += jit
+            dev_stats[dev_ip]['total_loss'] += loss
+            dev_stats[dev_ip]['total_score'] += score
+            dev_stats[dev_ip]['count'] += 1
+            dev_stats[dev_ip]['hostname'] = item.get('host_name', '')
+            dev_stats[dev_ip]['site_id'] = str(item.get('siteid', ''))
+            
+            dev_stats[dev_ip]['tunnels'][tc]['total_lat'] += lat
+            dev_stats[dev_ip]['tunnels'][tc]['total_jit'] += jit
+            dev_stats[dev_ip]['tunnels'][tc]['total_loss'] += loss
+            dev_stats[dev_ip]['tunnels'][tc]['total_score'] += score
+            dev_stats[dev_ip]['tunnels'][tc]['count'] += 1
+            dev_stats[dev_ip]['tunnels'][tc]['state'] = item.get('state', '')
+            dev_stats[dev_ip]['tunnels'][tc]['sla_names'] = item.get('sla_class_names', '')
+        
+        # Ordenar dispositivos por peor latencia promedio
+        devs_ranked = sorted(dev_stats.items(),
+                             key=lambda x: x[1]['total_lat'] / max(x[1]['count'], 1),
+                             reverse=True)
+        
+        total_devs = len(devs_ranked)
+        total_tunnels = sum(len(s['tunnels']) for _, s in devs_ranked)
+        
+        def fmt_score(score):
+            if score >= 8: return f"🟢 {score:.1f}"
+            if score >= 5: return f"🟡 {score:.1f}"
+            if score >= 3: return f"🟠 {score:.1f}"
+            return f"🔴 {score:.1f}"
+        
+        # ===== CONSTRUIR RESULTADO =====
+        resultado = f"🔗 SLA DE TÚNELES SD-WAN (Approute)\n"
+        resultado += f"{'='*140}\n\n"
+        resultado += f"📦 Registros analizados: {len(approute_data):,}\n"
+        resultado += f"📡 Dispositivos: {total_devs} | Túneles: {total_tunnels}\n"
+        if sitio:
+            resultado += f"🔎 Filtro sitio: '{sitio}'\n"
+        if color:
+            resultado += f"🔎 Filtro color: '{color}'\n"
+        
+        # Detectar túneles degradados
+        degraded = []
+        for dev_ip, stats in devs_ranked:
+            n = max(stats['count'], 1)
+            avg_loss = stats['total_loss'] / n
+            avg_lat = stats['total_lat'] / n
+            if avg_loss > 1.0 or avg_lat > 100:
+                degraded.append((stats['hostname'], avg_lat, avg_loss))
+        
+        if degraded:
+            resultado += f"\n⚠️  DISPOSITIVOS CON SLA DEGRADADO: {len(degraded)}\n"
+            for hostname, lat, loss in degraded[:10]:
+                resultado += f"   🔴 {hostname}: {lat:.0f}ms latencia, {loss:.2f}% pérdida\n"
+        
+        # Tabla resumen por color
+        resultado += f"\n{'='*140}\n"
+        resultado += f"📋 SLA PROMEDIO POR TIPO DE ENLACE:\n\n"
+        resultado += f"{'COLOR TÚNEL':<30} {'LATENCIA':<14} {'JITTER':<12} {'PÉRDIDA':<10} {'VQoE':<10} {'MUESTRAS':<10}\n"
+        resultado += f"{'-'*90}\n"
+        
+        color_names = {
+            'private1:private1': 'MPLS → MPLS',
+            'gold:gold': 'Internet → Internet',
+            'gold:silver': 'Internet → Internet(B)',
+            'silver:silver': 'Internet(B) → Internet(B)',
+            'silver:gold': 'Internet(B) → Internet',
+            'private1:gold': 'MPLS → Internet',
+            'gold:private1': 'Internet → MPLS',
+        }
+        
+        for tc, stats in sorted(color_stats.items(),
+                                key=lambda x: x[1]['total_lat'] / max(x[1]['count'], 1),
+                                reverse=True):
+            n = max(stats['count'], 1)
+            avg_lat = stats['total_lat'] / n
+            avg_jit = stats['total_jit'] / n
+            avg_loss = stats['total_loss'] / n
+            avg_score = stats['total_score'] / n
+            
+            icon = "🔴" if avg_loss > 1 else "🟠" if avg_loss > 0.5 else "🟡" if avg_lat > 50 else "🟢"
+            label = color_names.get(tc, tc)
+            resultado += (f"{icon} {label:<28} {avg_lat:>8.1f} ms   {avg_jit:>7.1f} ms  "
+                         f"{avg_loss:>6.3f}%   {fmt_score(avg_score):<10} {stats['count']:>6}\n")
+        
+        # Ranking de dispositivos
+        resultado += f"\n{'='*140}\n"
+        resultado += f"📋 RANKING DE DISPOSITIVOS (ordenado por peor latencia):\n\n"
+        resultado += f"{'#':<4} {'DISPOSITIVO':<35} {'SITIO':<10} {'LATENCIA':<14} {'JITTER':<12} {'PÉRDIDA':<10} {'VQoE':<10} {'TÚNELES':<8}\n"
+        resultado += f"{'-'*105}\n"
+        
+        for i, (dev_ip, stats) in enumerate(devs_ranked[:top], 1):
+            n = max(stats['count'], 1)
+            avg_lat = stats['total_lat'] / n
+            avg_jit = stats['total_jit'] / n
+            avg_loss = stats['total_loss'] / n
+            avg_score = stats['total_score'] / n
+            
+            icon = "🔴" if avg_loss > 1 else "🟠" if avg_loss > 0.5 else "🟡" if avg_lat > 50 else "🟢"
+            
+            resultado += (f"{i:<4} {icon} {stats['hostname']:<33} {stats['site_id']:<10} "
+                         f"{avg_lat:>8.1f} ms   {avg_jit:>7.1f} ms  "
+                         f"{avg_loss:>6.3f}%   {fmt_score(avg_score):<10} {len(stats['tunnels']):>4}\n")
+            
+            # Si se filtra por sitio, mostrar detalle por túnel
+            if sitio:
+                for tc, ts in sorted(stats['tunnels'].items(),
+                                      key=lambda x: x[1]['total_lat'] / max(x[1]['count'], 1),
+                                      reverse=True):
+                    tn = max(ts['count'], 1)
+                    t_lat = ts['total_lat'] / tn
+                    t_jit = ts['total_jit'] / tn
+                    t_loss = ts['total_loss'] / tn
+                    t_score = ts['total_score'] / tn
+                    t_state = ts['state']
+                    
+                    label = color_names.get(tc, tc)
+                    state_icon = "✅" if t_state == 'Up' else "❌"
+                    resultado += (f"     └─ {label:<25} {state_icon} "
+                                 f"lat={t_lat:.1f}ms  jit={t_jit:.1f}ms  "
+                                 f"loss={t_loss:.3f}%  score={fmt_score(t_score)}\n")
+        
+        if len(devs_ranked) > top:
+            resultado += f"\n     ... y {len(devs_ranked) - top} dispositivos más\n"
+        
+        # SLA classes disponibles
+        sla_names = set()
+        for item in approute_data:
+            names = item.get('sla_class_names', '')
+            if names:
+                for name in names.split(','):
+                    name = name.strip()
+                    if name and name != '__all_tunnels__':
+                        sla_names.add(name)
+        
+        resultado += f"\n{'='*140}\n"
+        resultado += f"💡 NOTAS:\n"
+        resultado += f"  • Latencia: <50ms bueno | 50-100ms aceptable | >100ms degradado\n"
+        resultado += f"  • Pérdida: <0.1% bueno | 0.1-1% aceptable | >1% problema\n"
+        resultado += f"  • VQoE: 0-10 (10=excelente, <5=problemas)\n"
+        resultado += f"  • Datos Approute de vManage — misma fuente que Analytics\n"
+        if sla_names:
+            resultado += f"  • SLA Classes configuradas: {', '.join(sorted(sla_names))}\n"
+        resultado += f"\n💡 HERRAMIENTAS RELACIONADAS:\n"
+        resultado += f"  • ver_sla_tuneles(sitio='720') — Detalle SLA de un sitio\n"
+        resultado += f"  • ver_sla_tuneles(color='gold') — Solo túneles por Internet\n"
+        resultado += f"  • ver_drops_qos() — Drops de QoS por dispositivo\n"
+        resultado += f"  • ver_calidad_saas_sitios() — Calidad de Office 365 / Webex\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener SLA de túneles: {str(e)}"
 
 
 if __name__ == "__main__":
