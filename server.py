@@ -2111,12 +2111,77 @@ def ver_aplicaciones_sitio(
                 resultado += f"💡 Usa ver_flujos_dpi_detalle(sitio='{site_ids[0]}') para ver IPs y puertos\n"
                 return resultado
             
-            resultado += f"ℹ️  No se encontraron datos DPI para este sitio en este momento.\n\n"
-            resultado += f"Esto puede ocurrir si:\n"
-            resultado += f"  • El sitio no tiene Data Policy con clasificación DPI activa\n"
-            resultado += f"  • Los datos aún no se han propagado al historial de vManage\n\n"
+            # === FALLBACK: Consultar CloudX (Cloud OnRamp for SaaS) ===
+            # DPI no tiene datos, pero CloudX funciona en ~95% de los routers
+            print(f"ℹ️  [{datetime.now().strftime('%H:%M:%S')}] Sin datos DPI, consultando CloudX (SaaS)...", file=sys.stderr)
+            
+            cloudx_apps = []
+            for dev in site_devices:
+                dev_ip = dev.get('system-ip', '')
+                try:
+                    cx = session.get(f"/dataservice/device/cloudx/applications?deviceId={dev_ip}", timeout=12)
+                    cx_data = cx.get('data', [])
+                    if cx_data:
+                        cloudx_apps.extend(cx_data)
+                except:
+                    pass
+            
+            if cloudx_apps:
+                # Hay datos CloudX — mostrarlos como alternativa
+                resultado += f"ℹ️  No hay datos DPI (Deep Packet Inspection) para este sitio.\n"
+                resultado += f"   Sin embargo, SÍ hay datos de Cloud OnRamp for SaaS (aplicaciones cloud):\n\n"
+                resultado += f"☁️  APLICACIONES SaaS EN TIEMPO REAL — SITIO {site_ids[0]}\n"
+                resultado += f"{'='*80}\n\n"
+                
+                # Clasificar por estado vQoE
+                good = [a for a in cloudx_apps if a.get('vqe-status') == 'goodSites']
+                average = [a for a in cloudx_apps if a.get('vqe-status') == 'averageSites']
+                bad = [a for a in cloudx_apps if a.get('vqe-status') == 'badSites']
+                
+                resultado += f"  📊 {len(cloudx_apps)} aplicaciones SaaS monitoreadas\n"
+                resultado += f"     ✅ Buena calidad: {len(good)}  ⚠️ Media: {len(average)}  ❌ Mala: {len(bad)}\n\n"
+                
+                # Ordenar por vqe-score descendente
+                cloudx_apps.sort(key=lambda x: float(x.get('vqe-score', 0)), reverse=True)
+                
+                resultado += f"  {'Aplicación':<35} {'vQoE':>5} {'Latencia':>10} {'Pérdida':>8} {'Estado':>12} {'Interfaz'}\n"
+                resultado += f"  {'-'*35} {'-'*5} {'-'*10} {'-'*8} {'-'*12} {'-'*15}\n"
+                
+                for app in cloudx_apps:
+                    nombre = app.get('application', '?')
+                    vqe = float(app.get('vqe-score', 0))
+                    lat = app.get('latency', '?')
+                    loss = app.get('loss', '?')
+                    status = app.get('vqe-status', '?')
+                    iface = app.get('interface', '?')
+                    
+                    if status == 'goodSites':
+                        emoji, estado = '✅', 'Buena'
+                    elif status == 'averageSites':
+                        emoji, estado = '⚠️', 'Media'
+                    else:
+                        emoji, estado = '❌', 'Mala'
+                    
+                    resultado += f"  {emoji} {nombre:<33} {vqe:>5.1f} {lat:>8}ms {loss:>7}% {estado:>10}  {iface}\n"
+                
+                resultado += f"\n  💡 exit-type: {cloudx_apps[0].get('exit-type', '?')} | VPN: {cloudx_apps[0].get('vpn-id', '?')}\n"
+                resultado += f"\n{'='*80}\n"
+                resultado += f"📌 NOTA: Estos son datos de Cloud OnRamp for SaaS (Office365, Webex).\n"
+                resultado += f"   El DPI profundo (clasificación de TODAS las apps) requiere Data Policy\n"
+                resultado += f"   con acción 'dpi' que no está configurada en este sitio.\n\n"
+                resultado += f"💡 Más herramientas:\n"
+                resultado += f"  • ver_calidad_saas_red() — Calidad SaaS de toda la red\n"
+                resultado += f"  • ver_calidad_saas_red(aplicacion='office365') — Office365 por sitio\n"
+                resultado += f"  • ver_saturacion_sitio('{site_ids[0]}') — Tráfico por interfaz WAN\n"
+                return resultado
+            
+            # Ni DPI ni CloudX tienen datos
+            resultado += f"ℹ️  No se encontraron datos de aplicaciones para este sitio.\n\n"
+            resultado += f"  • Sin datos DPI (requiere Data Policy con clasificación DPI)\n"
+            resultado += f"  • Sin datos CloudX/SaaS (Cloud OnRamp no configurado)\n\n"
             resultado += f"💡 HERRAMIENTAS ALTERNATIVAS:\n"
             resultado += f"  • ver_dpi_red_completa() — Ver qué sitios SÍ tienen datos DPI\n"
+            resultado += f"  • ver_calidad_saas_red() — Vista global de aplicaciones SaaS\n"
             resultado += f"  • ver_saturacion_sitio('{site_ids[0]}') — Tráfico real por interfaz WAN\n"
             resultado += f"  • ver_estadisticas_interfaces('{hostnames[0]}') — Estadísticas de interfaces\n"
             return resultado
