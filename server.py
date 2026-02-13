@@ -3997,6 +3997,304 @@ def ver_top_consumidores_dpi(
         return f"❌ Error al buscar consumidores DPI: {str(e)}"
 
 
+# ==========================================
+# HERRAMIENTAS CLOUD ON-RAMP / SaaS (CloudX)
+# ==========================================
+
+@mcp.tool()
+def ver_aplicaciones_saas_sitio(
+    sitio: str
+) -> str:
+    """
+    Muestra las aplicaciones SaaS (Office365, Webex, etc.) que un sitio SD-WAN está usando 
+    EN TIEMPO REAL, con métricas de calidad de experiencia (vQoE).
+    
+    Esto usa Cloud OnRamp for SaaS (CloudX) que funciona en TODOS los routers de la red
+    y muestra datos ACTUALES a diferencia de DPI que requiere Data Policy especial.
+    
+    Args:
+        sitio: ID del sitio, parcial o hostname (ej: "608", "51304", "SDWAN-CJF-608-RT01")
+    
+    Returns:
+        Lista de aplicaciones SaaS con latencia, pérdida, interfaz de salida y score vQoE.
+        El score vQoE va de 0 (malo) a 10 (excelente).
+    
+    Ejemplo:
+        ver_aplicaciones_saas_sitio("608") — Apps SaaS del sitio 608
+        ver_aplicaciones_saas_sitio("SDWAN-CJF-304-RT01") — Por hostname
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo aplicaciones SaaS del sitio: {sitio}", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Obtener dispositivos
+        devices_result = session.get("/dataservice/device")
+        all_devices = devices_result.get('data', [])
+        
+        # Buscar dispositivos del sitio
+        sitio_lower = sitio.strip().lower()
+        site_devices = []
+        
+        for dev in all_devices:
+            if dev.get('device-type') not in ('vedge', 'cedge') or dev.get('reachability') != 'reachable':
+                continue
+            dev_site_id = str(dev.get('site-id', ''))
+            dev_hostname = dev.get('host-name', '').lower()
+            
+            if (sitio_lower == dev_site_id.lower() or
+                sitio_lower in dev_site_id or
+                sitio_lower in dev_hostname):
+                site_devices.append(dev)
+        
+        if not site_devices:
+            return (f"❌ No se encontraron dispositivos WAN Edge para '{sitio}'\n"
+                    f"Usa buscar_dispositivo() o listar_dispositivos() para encontrar el ID correcto.")
+        
+        resultado = ""
+        site_id = site_devices[0].get('site-id', sitio)
+        
+        for dev in site_devices:
+            dev_ip = dev.get('system-ip', '')
+            hostname = dev.get('host-name', 'desconocido')
+            
+            resultado += f"\n📱 Dispositivo: {hostname} ({dev_ip}) — Sitio {site_id}\n"
+            resultado += "=" * 70 + "\n"
+            
+            try:
+                r = session.get(f"/dataservice/device/cloudx/applications?deviceId={dev_ip}", timeout=15)
+                apps = r.get('data', [])
+                
+                if not apps:
+                    resultado += "  ⚠️ Sin datos de aplicaciones SaaS (Cloud OnRamp no configurado)\n"
+                    continue
+                
+                # Clasificar por estado vQoE
+                good = [a for a in apps if a.get('vqe-status') == 'goodSites']
+                average = [a for a in apps if a.get('vqe-status') == 'averageSites']
+                bad = [a for a in apps if a.get('vqe-status') == 'badSites']
+                
+                resultado += f"\n  📊 RESUMEN: {len(apps)} aplicaciones SaaS monitoreadas\n"
+                resultado += f"     ✅ Buena calidad: {len(good)}  ⚠️ Media: {len(average)}  ❌ Mala: {len(bad)}\n\n"
+                
+                # Ordenar por vqe-score descendente
+                apps.sort(key=lambda x: float(x.get('vqe-score', 0)), reverse=True)
+                
+                resultado += f"  {'Aplicación':<35} {'vQoE':>5} {'Latencia':>10} {'Pérdida':>8} {'Estado':>12} {'Interfaz'}\n"
+                resultado += f"  {'-'*35} {'-'*5} {'-'*10} {'-'*8} {'-'*12} {'-'*15}\n"
+                
+                for app in apps:
+                    nombre = app.get('application', '?')
+                    vqe = float(app.get('vqe-score', 0))
+                    lat = app.get('latency', '?')
+                    loss = app.get('loss', '?')
+                    status = app.get('vqe-status', '?')
+                    iface = app.get('interface', '?')
+                    exit_type = app.get('exit-type', '?')
+                    
+                    # Emoji según estado
+                    if status == 'goodSites':
+                        emoji = '✅'
+                        estado = 'Buena'
+                    elif status == 'averageSites':
+                        emoji = '⚠️'
+                        estado = 'Media'
+                    else:
+                        emoji = '❌'
+                        estado = 'Mala'
+                    
+                    resultado += f"  {emoji} {nombre:<33} {vqe:>5.1f} {lat:>8}ms {loss:>7}% {estado:>10}  {iface}\n"
+                
+                resultado += f"\n  💡 exit-type: {apps[0].get('exit-type', '?')} | VPN: {apps[0].get('vpn-id', '?')}\n"
+                
+            except Exception as e:
+                resultado += f"  ❌ Error consultando dispositivo: {str(e)}\n"
+        
+        resultado += f"\n📌 NOTA: Estos datos son de Cloud OnRamp for SaaS (tiempo real).\n"
+        resultado += f"   Para DPI profundo (todas las apps), usa ver_aplicaciones_sitio().\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener aplicaciones SaaS: {str(e)}"
+
+
+@mcp.tool()
+def ver_calidad_saas_red(
+    horas: int = 1,
+    aplicacion: str = "",
+    sitio: str = ""
+) -> str:
+    """
+    Muestra la calidad de experiencia (vQoE) de aplicaciones SaaS como Office365 y Webex
+    a nivel de TODA LA RED o filtrado por sitio/aplicación, usando estadísticas CloudX históricas.
+    
+    Esta función usa analytics aggregation (POST) para obtener métricas promediadas de la red
+    completa. Funciona con TODOS los routers que tengan Cloud OnRamp for SaaS habilitado (~95% de la red).
+    
+    Args:
+        horas: Ventana de tiempo a analizar (default: 1 hora, max recomendado: 168 = 1 semana)
+        aplicacion: (Opcional) Filtrar por nombre de aplicación (ej: "office365", "webex")
+        sitio: (Opcional) Filtrar por site-id (ej: "52608", "51304")
+    
+    Returns:
+        Ranking de aplicaciones SaaS por calidad vQoE con latencia y pérdida promedio.
+        Incluye desglose por sitio si se filtra por aplicación.
+    
+    Ejemplo:
+        ver_calidad_saas_red() — Vista global última hora
+        ver_calidad_saas_red(horas=24) — Últimas 24 horas
+        ver_calidad_saas_red(aplicacion="office365") — Solo Office365 por sitio
+        ver_calidad_saas_red(sitio="52608", horas=24) — Un sitio, últimas 24h
+    """
+    try:
+        print(f"🔍 [{datetime.now().strftime('%H:%M:%S')}] Obteniendo calidad SaaS de la red (últimas {horas}h)", file=sys.stderr)
+        
+        session = get_vmanage_session()
+        
+        # Construir reglas de filtro
+        rules = [{
+            'value': [str(horas)],
+            'field': 'entry_time',
+            'type': 'date',
+            'operator': 'last_n_hours'
+        }]
+        
+        if sitio:
+            # Resolver site-id completo si es parcial
+            if not sitio.startswith('5'):
+                sitio = f"5{sitio}"
+            rules.append({
+                'value': [sitio],
+                'field': 'site_id',
+                'type': 'long',
+                'operator': 'in'
+            })
+        
+        if aplicacion:
+            rules.append({
+                'value': [aplicacion.lower()],
+                'field': 'application',
+                'type': 'string',
+                'operator': 'in'
+            })
+        
+        # Decidir agrupación según filtros
+        group_fields = [{'property': 'application', 'sequence': 1}]
+        
+        if aplicacion:
+            # Si se filtra por app, desglosar por sitio
+            group_fields.append({'property': 'site_id', 'sequence': 2})
+        
+        payload = {
+            'query': {
+                'condition': 'AND',
+                'rules': rules
+            },
+            'aggregation': {
+                'field': group_fields,
+                'metrics': [
+                    {'property': 'latency', 'type': 'avg'},
+                    {'property': 'loss', 'type': 'avg'},
+                    {'property': 'vqe_score', 'type': 'avg'}
+                ]
+            }
+        }
+        
+        r = session.post('/dataservice/statistics/cloudx/aggregation', payload, timeout=30)
+        data = r.get('data', [])
+        
+        if not data:
+            return (f"⚠️ Sin datos CloudX para los filtros especificados (últimas {horas}h)\n\n"
+                    f"💡 Para ver datos en tiempo real por dispositivo, usa:\n"
+                    f"  ver_aplicaciones_saas_sitio('608')")
+        
+        # Ordenar por vqe_score descendente
+        data.sort(key=lambda x: float(x.get('vqe_score', 0)), reverse=True)
+        
+        resultado = f"☁️ CALIDAD DE APLICACIONES SaaS — Últimas {horas}h\n"
+        resultado += "=" * 75 + "\n\n"
+        
+        if aplicacion:
+            # Desglose por sitio para una aplicación
+            resultado += f"📱 Aplicación: {aplicacion.upper()}\n"
+            resultado += f"📊 {len(data)} sitios con datos\n\n"
+            
+            resultado += f"  {'Sitio':>8} {'vQoE':>6} {'Latencia':>10} {'Pérdida':>8} {'Muestras':>10} {'Estado'}\n"
+            resultado += f"  {'-'*8} {'-'*6} {'-'*10} {'-'*8} {'-'*10} {'-'*12}\n"
+            
+            for d in data:
+                site = str(d.get('site_id', '?'))
+                vqe = float(d.get('vqe_score', 0))
+                lat = float(d.get('latency', 0))
+                loss = float(d.get('loss', 0))
+                count = d.get('count', 0)
+                
+                if vqe >= 7:
+                    emoji = '✅'
+                    estado = 'Buena'
+                elif vqe >= 4:
+                    emoji = '⚠️'
+                    estado = 'Media'
+                else:
+                    emoji = '❌'
+                    estado = 'Mala'
+                
+                resultado += f"  {emoji} {site:>6} {vqe:>6.1f} {lat:>8.0f}ms {loss:>7.1f}% {count:>10} {estado}\n"
+            
+            # Estadísticas globales
+            avg_vqe = sum(float(d.get('vqe_score',0)) for d in data) / len(data)
+            avg_lat = sum(float(d.get('latency',0)) for d in data) / len(data)
+            bad_sites = sum(1 for d in data if float(d.get('vqe_score',0)) < 4)
+            resultado += f"\n  📈 Promedio global: vQoE={avg_vqe:.1f}, Latencia={avg_lat:.0f}ms\n"
+            resultado += f"  🔴 Sitios con mala calidad: {bad_sites}/{len(data)}\n"
+            
+        else:
+            # Vista global por aplicación
+            resultado += f"📊 {len(data)} aplicaciones SaaS monitoreadas\n"
+            if sitio:
+                resultado += f"📍 Filtrado por sitio: {sitio}\n"
+            resultado += "\n"
+            
+            resultado += f"  {'Aplicación':<35} {'vQoE':>6} {'Latencia':>10} {'Pérdida':>8} {'Muestras':>10} {'Estado'}\n"
+            resultado += f"  {'-'*35} {'-'*6} {'-'*10} {'-'*8} {'-'*10} {'-'*12}\n"
+            
+            for d in data:
+                app = d.get('application', '?')
+                vqe = float(d.get('vqe_score', 0))
+                lat = float(d.get('latency', 0))
+                loss = float(d.get('loss', 0))
+                count = d.get('count', 0)
+                
+                if vqe >= 7:
+                    emoji = '✅'
+                    estado = 'Buena'
+                elif vqe >= 4:
+                    emoji = '⚠️'
+                    estado = 'Media'
+                else:
+                    emoji = '❌'
+                    estado = 'Mala'
+                
+                resultado += f"  {emoji} {app:<33} {vqe:>6.1f} {lat:>8.0f}ms {loss:>7.1f}% {count:>10} {estado}\n"
+            
+            # Resumen
+            good = sum(1 for d in data if float(d.get('vqe_score',0)) >= 7)
+            avg_count = sum(1 for d in data if 4 <= float(d.get('vqe_score',0)) < 7)
+            bad = sum(1 for d in data if float(d.get('vqe_score',0)) < 4)
+            resultado += f"\n  📈 Resumen: ✅ {good} buenas | ⚠️ {avg_count} medias | ❌ {bad} malas\n"
+        
+        resultado += f"\n💡 Tips:\n"
+        resultado += f"  • ver_aplicaciones_saas_sitio('608') — Detalle real-time de un sitio\n"
+        resultado += f"  • ver_calidad_saas_red(aplicacion='office365') — Office365 por sitio\n"
+        resultado += f"  • ver_calidad_saas_red(horas=168) — Tendencia semanal\n"
+        
+        return resultado
+        
+    except Exception as e:
+        return f"❌ Error al obtener calidad SaaS: {str(e)}"
+
+
 if __name__ == "__main__":
     """
     Punto de entrada principal del servidor MCP.
